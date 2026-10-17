@@ -19,7 +19,8 @@ optdepends=('python-pillow: 导出 PNG 指纹图')
 makedepends=('linux-headers')
 install=packaging/gdix51c0-fp.install
 # 内核模块由自己编译，不让 makepkg 的 strip 去动 .ko
-options=(!strip)
+options=(!strip !debug)
+# !debug：模块由 DKMS 自己编，没必要留 /usr/src/debug 下的源码副本
 
 _srcname="gdix51c0-fp-${pkgver}"
 
