@@ -33,3 +33,6 @@ src/
 .vscode/
 .idea/
 *.swp
+
+# 已构建的包（现成产物，方便直接 pacman -U）
+dist/
