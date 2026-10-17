@@ -47,6 +47,7 @@ tools/       gdix51c0/                  用户态协议栈（Python）
   session.py     初始化序列、采图、FDT
 packaging/   dkms.conf.in / Makefile.kbuild / .install / 启动器
 PKGBUILD     pacman 包定义（本项目以 pacman 包交付）
+tests/       假设备驱动的协议时序单测（不需硬件）
 docs/        逆向报告
 analysis/    ACPI 与协议取证材料
 ```
@@ -76,6 +77,7 @@ sudo gdix51c0 provision --yes # 生成并部署 PSK（破坏性！）
 sudo gdix51c0 capture --wait -o ~/finger.pgm
 sudo gdix51c0 capture --ascii # 终端直接看纹路
 gdix51c0 selftest             # 不需要硬件的纯软件自检
+python3 /usr/share/doc/gdix51c0-fp/tests/test_proto.py   # 协议时序单测（假设备）
 ```
 
 模块参数（`/etc/modprobe.d/` 里调）：
