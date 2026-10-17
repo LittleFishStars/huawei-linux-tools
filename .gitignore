@@ -1,0 +1,35 @@
+# 内核模块编译产物
+driver/*.o
+driver/*.ko
+driver/*.mod
+driver/*.mod.c
+driver/.*.cmd
+driver/Module.symvers
+driver/modules.order
+driver/.modules.order.cmd
+driver/.module-common.o
+driver/..module-common.o.cmd
+driver/.tmp_versions/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 打包产物
+pkg/
+src/
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.pkg.tar.gz
+
+# 采到的指纹图（生物特征，不该进仓库）
+*.pgm
+*.png
+!docs/**/*.png
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""``gdix51c0`` 启动器（安装到 /usr/bin）。"""
+
+import sys
+
+from gdix51c0.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,14 @@
+# DKMS 描述文件（打包时 PKGBUILD 把 @VERSION@ 替换成实际版本）
+#
+# 不指定 MAKE[0]/CLEAN：dkms 的默认命令就是
+#   make -C $kernel_source_dir M=$dkms_tree/<mod>/<ver>/build [clean]
+# 只要 /usr/src/gdix51c0-fp-<ver>/Makefile 是 Kbuild 风格的即可。
+# 开发用的完整 Makefile 在仓库 driver/ 下，不装进包里。
+
+PACKAGE_NAME="gdix51c0-fp"
+PACKAGE_VERSION="@VERSION@"
+
+BUILT_MODULE_NAME[0]="gdix51c0_fp"
+DEST_MODULE_LOCATION[0]="/extra"
+
+AUTOINSTALL="yes"
