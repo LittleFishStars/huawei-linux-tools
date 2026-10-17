@@ -113,12 +113,12 @@ class Session:
         if self.io is None:
             return None
         if self.info is not None and not self.info.irq_gpio_valid:
-            return self.io.read_packet(timeout)
+            return self.io.next_packet(timeout)
         if self.dev.irq_level():
-            return self.io.read_packet(timeout)
+            return self.io.next_packet(timeout)
         if not self._await_irq(timeout):
             return None
-        return self.io.read_packet(timeout)
+        return self.io.next_packet(timeout)
 
     def read_tls_packet(self, timeout: float) -> bytes | None:
         """TLS 层要的"读一条记录"回调。"""
@@ -144,12 +144,9 @@ class Session:
     # -- 初始化 --
 
     def _drain(self, seconds: float = 0.005) -> None:
-        """把总线上残留的包读空。"""
+        """把总线上残留的包读空（连同停滞区）。"""
         assert self.io is not None
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
-            if self.io.read_packet(0.01) is None:
-                return
+        self.io.drain(seconds)
 
     def _wait_cmd(self, cmd: int, timeout: float) -> wire.Command:
         """等一条指定命令号的响应，跳过其它包。"""
@@ -396,11 +393,11 @@ class Session:
         raise SessionError(f"采图失败（{attempts} 次尝试）：{last}")
 
     def _drain_cmd(self, cmd: int, seconds: float) -> None:
-        """把指定命令号的陈旧包读掉。"""
+        """把指定命令号的陈旧包读掉（也清停滞区里同命令的）。"""
         assert self.io is not None
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            pkt = self.io.read_packet(0.010)
+            pkt = self.io.next_packet(0.010)
             if pkt is None:
                 continue
             if pkt.inner_cmd == cmd:

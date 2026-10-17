@@ -32,7 +32,8 @@ prepare() {
     rm -rf "${srcdir:?}/${_srcname}"
     mkdir -p "${srcdir}/${_srcname}"
     cp -a "${startdir}/driver" "${startdir}/tools" \
-          "${startdir}/packaging" "${startdir}/LICENSE" "${startdir}/README.md" \
+          "${startdir}/packaging" "${startdir}/tests" \
+          "${startdir}/LICENSE" "${startdir}/README.md" \
           "${srcdir}/${_srcname}/"
     # 开发树里的编译产物不进包
     find "${srcdir}/${_srcname}" \
@@ -71,4 +72,7 @@ package() {
     # ---- 文档与许可证 ----
     install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
     install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+    # ---- 离线自检用到的单测一并装上 ----
+    install -Dm644 tests/test_proto.py "${pkgdir}/usr/share/doc/${pkgname}/tests/test_proto.py"
 }

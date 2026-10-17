@@ -29,6 +29,8 @@ MAX_PAYLOAD = 8192
 CMD_ATTEMPTS = 2
 #: 写之前复现 Windows 的 Sleep(1)
 PRE_SEND_DELAY = 0.001
+#: ACK 之后多读一次的宽限：同 IRQ 窗口里的响应应该已经到了
+SAME_IRQ_GRACE = 0.050
 
 ACK_TIMEOUT = 1.0
 RESPONSE_TIMEOUT = 1.0
@@ -62,6 +64,11 @@ class PacketIo:
         self.dev = dev
         self.speed_hz = speed_hz
         self.chunk = chunk
+        # 有些命令（0x82 读寄存器、0xa6 读 OTP、0xa2 复位）的 ACK 与响应
+        # 落在同一个 IRQ 高电平窗口里。先收 ACK 的那一方会把响应也读进来，
+        # 而“先等 ACK 再等响应”的调用方就会因为响应已到手却看不见而超时。
+        # 多出来的包停在这里，由 next_packet() 先吐。
+        self._stash: list[Packet] = []
 
     # -- 原始搬运 --
 
@@ -133,14 +140,49 @@ class PacketIo:
         time.sleep(PRE_SEND_DELAY)
         self.write_packet(wire.OUTER_WRITE, payload)
 
+    def next_packet(self, timeout: float = RESPONSE_TIMEOUT) -> Packet | None:
+        """取下一个包：先吐停滞区，再上总线读。
+
+        所有读包的调用方都应该走这里，不要直接调 read_packet —— 否则会把
+        ACK 与响应同窗口的命令拆散。
+        """
+        if self._stash:
+            return self._stash.pop(0)
+        return self.read_packet(timeout)
+
+    def stash_tail(self, timeout: float) -> None:
+        """把总线上还挂着的包收进停滞区（用于 ACK 后的“同 IRQ”响应）。
+
+        上游的做法是：发完命令等一个 IRQ，在那个高电平窗口里先读 ACK、
+        再紧接着读响应，两次读都在同一个窗口内。本函数就是这个“再紧接着
+        读”，读不到就静默返回。
+        """
+        pkt = self.read_packet(timeout)
+        if pkt is not None:
+            self._stash.append(pkt)
+
+    def drain(self, seconds: float = 0.005) -> None:
+        """丢清楚停滞区与总线上的残留包。"""
+        self._stash.clear()
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if self.read_packet(0.005) is None:
+                break
+
     def send_and_ack(self, payload: bytes, timeout: float = ACK_TIMEOUT) -> None:
-        """写 → ACK 包。上游允许重投一次。"""
+        """写 → ACK 包。上游允许重投一次。
+
+        收到 ACK 后会多读一次，把落在同一 IRQ 窗口里的响应收进停滞区。
+        这次额外的读不消耗调用方的超时预算（读不到就算了）。
+        """
         last: Exception | None = None
-        for _ in range(CMD_ATTEMPTS):
+        for attempt in range(CMD_ATTEMPTS):
             time.sleep(PRE_SEND_DELAY)
             self.write_packet(wire.OUTER_WRITE, payload)
-            pkt = self.read_packet(timeout)
+            pkt = self.next_packet(timeout)
             if pkt is not None and pkt.inner_cmd == wire.CMD_ACK:
+                # 同窗口的响应：不读会丢，读不到不报错
+                self.stash_tail(SAME_IRQ_GRACE)
                 return
             last = ProtoError(
                 f"等 ACK 超时或类型不符（拿到 {pkt.inner_cmd if pkt else None}）"
@@ -150,9 +192,9 @@ class PacketIo:
     def send_ack_then_response(
         self, payload: bytes, timeout: float = RESPONSE_TIMEOUT
     ) -> wire.Command:
-        """写 → ACK → 再单独等一条响应（reset_sensor 等）。"""
+        """写 → ACK → 再等一条响应（reset_sensor、读寄存器、读 OTP）。"""
         self.send_and_ack(payload, timeout)
-        pkt = self.read_packet(timeout)
+        pkt = self.next_packet(timeout)
         if pkt is None:
             raise ProtoError(f"命令 0x{payload[0]:02x} 收到 ACK 但没有响应")
         return pkt.command()
@@ -161,7 +203,7 @@ class PacketIo:
         """写 → 直接读一条响应，中间没有 ACK（get-mcu-state 等）。"""
         time.sleep(PRE_SEND_DELAY)
         self.write_packet(wire.OUTER_WRITE, payload)
-        pkt = self.read_packet(timeout)
+        pkt = self.next_packet(timeout)
         if pkt is None:
             raise ProtoError(f"命令 0x{payload[0]:02x} 没有响应")
         return pkt.command()
