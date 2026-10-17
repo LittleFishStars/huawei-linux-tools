@@ -10,20 +10,24 @@ $$\boxed{\text{这颗 NFC 是一张「永远在线的只读标签」，RF 侧自
 
 - 芯片挂在 `i2c-0` 的 **0x57**，速率 400 kHz，控制器 `\_SB.PC00.I2C0`
 - 中断是 `GpioInt(Edge, ActiveHigh, pin 176)` → **irq 213**，语义为 field-detect
-- 手机贴上时芯片自己把 `https://consumer.huawei.com/en/support/huaweishare` 这条 NDEF 交给手机
+- 手机贴上时芯片自己把两条 NDEF（华为分享网址 + `application/vnd.huawei.handoff.ndefmsg`）交给手机
 - **手机上能看到链接就说明 NFC 功能已完整可用**，与操作系统无关
 
-Windows 驱动做的是另一件事：「碰一碰 → PC 侧 Huawei Share 联动」。它不导入 `nfccx.sys`，
-走私有 SPB 通道 + 空密钥 HMAC-SHA256 八组挑战应答，**不含任何标准 NCI 命令**。
-这部分在 Linux 上不移植也不影响手机读标签。
+芯片是 **NXP NTAG I2C plus 家族（NT3H2x11）**：NFC Forum Type 2 标签 + I2C 主机接口。
+ACPI HID 就叫 `NTAG0001`。
+
+Windows 驱动 `SpbNfcDriver.sys` 不是它的驱动——**标签不需要驱动**。
+它做的是「碰一碰 → PC 侧华为分享联动」：不导入 `nfccx.sys`，走私有 SPB 通道
++ 空密钥 HMAC-SHA256 八组挑战应答，不含任何标准 NCI 命令。这部分不移植也不影响手机读标签。
 
 ## 目录
 
 ```
 driver/      ntag_nfc.c + Makefile   内核模块：绑定 ACPI、暴露 /dev/ntag_nfc、注册 FD 中断
-tools/       touchd.py               触碰事件守护进程（轮询 irq 计数，可挂回调）
+tools/       ntag_seek.py            ★ 主力：按块寻址读完整内存镜像，解 CC/TLV/NDEF
+             touchd.py               触碰事件守护进程（轮询 irq 计数，可挂回调）
              bus_diag.py             I2C 总线体检（对照组 / 全扫 / 组帧试错）
-             ntag_dump.py            把 0x57 的数据流完整抓下来并解析 NDEF
+             ntag_dump.py            数据流抓取与 NDEF 解析（裸读路径，作对照）
              ntag_id.py              单次只读识别
              get_acpi.sh             dump + 反编译 ACPI，定位 NTAG0001
              fix_touchpad.sh         适配器 wedged 后救援触控板（已验证）
@@ -35,17 +39,17 @@ docs/        逆向与适配报告.md          完整逆向报告
 ## 快速开始
 
 ```bash
-# 1. 触碰事件（唯一还需要做的事）
+# 1. 读片上内存（主要用途）：按块寻址拉全镜像，自动解 NDEF
+sudo python3 tools/ntag_seek.py
+#   预期 block 0 = 1d d3 b4 ...（与手机端标签工具读到的 UID 一致）
+
+# 2. 触碰事件
 sudo insmod driver/ntag_nfc.ko probe_on_load=0
 sudo python3 tools/touchd.py --exec 'notify-send "NFC" "手机碰触于 %s"'
-# 手机贴到掌托右侧 NFC 标识处，应弹通知
 
-# 2. 看硬件事实
-cat /sys/devices/.../ntag_nfc/info      # 从地址 / 中断号 / 摘要长度
+# 3. 看硬件事实
 grep ntag_nfc /proc/interrupts          # 触碰时计数 +1
-
-# 3. 验证 ACPI（需要 root）
-sudo tools/get_acpi.sh
+sudo tools/get_acpi.sh                  # 反编译 ACPI 看 _CRS
 ```
 
 ## 构建内核模块
@@ -73,6 +77,46 @@ sudo insmod ntag_nfc.ko probe_on_load=0
   读数全不可信。`bus_diag.py` 的对照组就是为了区分「真数据」和「假数据」。
 - `-110` 不等于设备坏：地址被 ACK、随后设备拉住 SCL，是「设备活着但没数据」。
   `-121 EREMOTEIO` 才是「这个地址没人」。
+
+## 芯片身份（手机端实测，不是猜的）
+
+用 Android「标签工具」贴着掌托读出来的：
+
+| 字段 | 值 |
+|---|---|
+| 标签UID | `1D D3 B4 D8 82 00 00` |
+| 标签技术 | `NFC-A NDEF` |
+| Forum类型 | **`NFC_FORUM_TYPE_2`** |
+| 是否可写 / 设置只读 | `false` / `true` |
+| 记录1 | `https://consumer.huawei.com/en/support/huaweisharewelcome/` |
+| 记录2 | **`application/vnd.huawei.handoff.ndefmsg`**（华为自定义二进制载荷）|
+
+「NFC Forum Type 2」+「I2C 主机接口」= **NXP NTAG I2C plus 家族（NT3H2x11）**。
+ACPI HID 就叫 `NTAG0001`，本来就是 NXP NTAG 系列的命名。
+
+### 这解释了之前的全部怪现象
+
+| 现象 | 真因 |
+|---|---|
+| 裸读能读到真 NDEF | 从芯片**内部指针**读起，指针停在哪就从哪读 |
+| 读完 53 字节后一直 `-110` | 读到内存末尾后**拉低 SCL 不放总线**，等新的地址字节 |
+| 发 NCI `CORE_RESET` 全超时 | 这颗芯片**根本不说 NCI**，只会回 READ/WRITE/GET_VERSION/PWD_AUTH |
+| 不存在地址也是 `-110` 不是 `-121` | 适配器已被前一次超时搞死，所有读数都是噪声 |
+
+### 正确的寻址方式
+
+```
+读 block N:  S + 0x57(W) + [N] + Sr + 0x57(R) + 16B + NAK + P
+```
+
+| 块 | 内容 |
+|---|---|
+| `0x00` | UID0..2 + BCC0（应为 `1d d3 b4 …`）|
+| `0x01` | UID3..6 |
+| `0x02` | BCC1 + internal + lock bytes |
+| `0x03` | 能力容器 CC（应为 `E1 10 xx 00`）|
+| `0x04` 起 | 用户内存，NDEF TLV |
+| `F8h` 起 | 64 字节 SRAM |
 
 ## 硬件事实速查
 
