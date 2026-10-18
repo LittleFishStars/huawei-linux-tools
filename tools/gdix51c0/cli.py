@@ -522,10 +522,10 @@ def cmd_pin(args: argparse.Namespace) -> int:
     print("    → 这根线不是复位/使能，传感器没被正确上电或引脚用途另有其他，")
     print("      需要从 Windows 驱动侧确认它的真实语义。")
     print()
-    print("注意：_CRS 里这根线是 active-low + pullup，即空闲为高。")
-    print("  若是复位脚，高 = 不复位（芯片应正常工作）；")
-    print("  若是电源使能，高 = 断电（芯片根本不供电，MISO 自然是全 ff）。")
-    print("  后者能一次性解释'SPI 传输成功但无应答 + 中断空转'。")
+    print("注意：_CRS 里这根线是 active-low + pullup。")
+    print("  驱动默认把它**一直驱动在未复位电平**（reset_release=0）。")
+    print("  若'释放'那一行明显更好，说明板上确实有上拉，可用")
+    print("  modprobe gdix51c0_fp reset_release=1 对照。")
     return 0
 
 

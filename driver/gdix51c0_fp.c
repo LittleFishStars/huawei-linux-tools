@@ -141,6 +141,18 @@ MODULE_PARM_DESC(speed_hz, "SPI 时钟，默认 10000000 (10 MHz)");
  * active_low 会覆盖 _CRS 的极性，默认 false 会把物理极性弄反。
  */
 static int reset_active_low = -1;
+
+/*
+ * 1 = 复位脉冲后释放 line（交回给平台上拉）。
+ *
+ * 默认 0：一直驱动在“不复位”电平。参考实现是释放的，但那假定板上真有
+ * 上拉；本机实测释放后芯片表现为一直处于复位（MISO 全 ff + INT 浮空
+ * 噪声风暴），而同样的硬件在 Windows 下正常。想要对照行为时把它设 1。
+ */
+static bool reset_release;
+module_param(reset_release, bool, 0444);
+MODULE_PARM_DESC(reset_release,
+		 "1=复位脉冲后释放复位脚（默认 0，一直驱动在未复位电平）");
 module_param(reset_active_low, int, 0444);
 MODULE_PARM_DESC(reset_active_low,
 		 "复位脚极性：-1=跟随 ACPI _CRS（默认），0=高有效，1=低有效");
@@ -286,10 +298,13 @@ static void gdix51c0_hw_reset(struct gdix51c0 *gd, u32 hold_us)
 	if (!gd->reset_valid)
 		return;
 
-	ret = gdix51c0_reset_acquire(gd);
-	if (ret) {
-		dev_warn_once(gd->dev, "复位脚重新申请失败: %d\n", ret);
-		return;
+	/* probe 已经握住了；万一被放掉（reset_release=1 的上一轮）再申请一次 */
+	if (!gd->reset_gpio) {
+		ret = gdix51c0_reset_acquire(gd);
+		if (ret) {
+			dev_warn_once(gd->dev, "复位脚重新申请失败: %d\n", ret);
+			return;
+		}
 	}
 
 	/*
@@ -302,9 +317,23 @@ static void gdix51c0_hw_reset(struct gdix51c0 *gd, u32 hold_us)
 	gpiod_set_value_cansleep(gd->reset_gpio, 0);
 	usleep_range(10000, 11000);
 
-	/* 释放：线上拉接管，把 MCU 真正放出复位 */
-	devm_gpiod_put(gd->dev, gd->reset_gpio);
-	gd->reset_gpio = NULL;
+	/*
+	 * **保持驱动为“不复位”电平，不要释放。**
+	 *
+	 * 一度照着参考实现把 line 释放掉，理由是"让平台上拉把 MCU 拉出复位"。
+	 * 但那依赖板上真有上拉电阻；_CRS 里的 pullup 只是申请引脚配置，
+	 * 不等于硬件存在上拉。释放后引脚回到默认输入态、未复位的电平不再由
+	 * 我们保证，一旦落到有效电平，芯片就一直被按在复位里：
+	 *   - MISO 高阻 → 读回恒为 0xff
+	 *   - INT 浮空  → 双边沿噪声风暴（实测约 1200 次/秒）
+	 * 而这台机器在 Windows 下指纹完全正常，Windows 的驱动也不会释放这根线。
+	 *
+	 * 所以：除非显式要求（reset_release=1），否则一直把它驱动在未复位电平。
+	 */
+	if (reset_release) {
+		devm_gpiod_put(gd->dev, gd->reset_gpio);
+		gd->reset_gpio = NULL;
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -1033,32 +1062,27 @@ static int gdix51c0_setup_power_and_irq(struct gdix51c0 *gd)
 	 * 只剩一条释放边沿，没有真正的复位脉冲。
 	 */
 	/*
-	 * 只验证一下复位脚能不能取到，然后立即释放。
+	 * 取到就**一直握住**，并且立刻驱动到“不复位”电平。
 	 *
-	 * 不能在这里长期持有：hw_reset() 每次都要重新申请再释放（见文件头），
-	 * 若这里占着，重新申请会直接 EBUSY。
+	 * 这一点很关键：从模块加载到第一次复位之间，如果这根线是浮空的，
+	 * 芯片可能就一直处于复位态（表现为 MISO 全 ff + INT 浮空噪声风暴）。
+	 * hw_reset() 会复用同一个描述符，不再重复申请（重复申请会 EBUSY）。
 	 */
-	{
-		struct gpio_desc *probe_desc;
-
-		probe_desc = devm_gpiod_get_index(gd->dev, "reset", 0,
-						  GPIOD_OUT_LOW);
-		if (IS_ERR(probe_desc)) {
-			ret = PTR_ERR(probe_desc);
-			dev_warn(gd->dev,
-				 "复位脚解析失败 (crs_entry_index=%d, %d)，复位功能不可用\n",
-				 reset_gpio_index, ret);
-		} else {
-			gd->reset_valid = true;
-			gd->reset_active_low =
-				gdix51c0_reset_gpio_params[0].active_low ? 1 : 0;
-			dev_info(gd->dev,
-				 "复位脚就绪 (crs_entry_index=%d, active_low=%d)\n",
-				 reset_gpio_index,
-				 gdix51c0_reset_gpio_params[0].active_low ? 1 : 0);
-			/* 交还活：让线上拉接管 */
-			devm_gpiod_put(gd->dev, probe_desc);
-		}
+	ret = gdix51c0_reset_acquire(gd);
+	if (ret) {
+		dev_warn(gd->dev,
+			 "复位脚解析失败 (crs_entry_index=%d, %d)，复位功能不可用\n",
+			 reset_gpio_index, ret);
+	} else {
+		gd->reset_valid = true;
+		gd->reset_active_low =
+			gdix51c0_reset_gpio_params[0].active_low ? 1 : 0;
+		/* 明确驱动到“不复位”电平，别让它悬着 */
+		gpiod_set_value_cansleep(gd->reset_gpio, 0);
+		dev_info(gd->dev,
+			 "复位脚就绪 (crs_entry_index=%d, active_low=%d, 已置未复位)\n",
+			 reset_gpio_index,
+			 gdix51c0_reset_gpio_params[0].active_low ? 1 : 0);
 	}
 
 	/*
