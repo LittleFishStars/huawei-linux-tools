@@ -57,6 +57,27 @@ I2C_RDWR = 0x0707
 I2C_M_RD = 0x0001
 EREMOTEIO = 121
 ETIMEDOUT = 110
+ENXIO = 6
+EIO = 5
+
+ERRNAMES = {
+    5: "EIO",
+    6: "ENXIO(地址无人应答)",
+    16: "EBUSY",
+    110: "ETIMEDOUT(设备活着但没给数据/适配器卡死)",
+    121: "EREMOTEIO(NAK，地址没人)",
+}
+
+
+def errname(e):
+    """把内核返回的负 errno 变成可读名字。"""
+    if e is None:
+        return "?"
+    if e in ERRNAMES:
+        return ERRNAMES[e]
+    if -e in ERRNAMES:
+        return ERRNAMES[-e]
+    return "errno=%r" % (e,)
 
 EEPROM_SIZE = 1024
 I2C_ADDR = 0x57
@@ -102,16 +123,39 @@ class Bus:
     def close(self):
         os.close(self.fd)
 
-    def _run(self, m, buf):
-        arr = (ctypes.c_uint8 * max(len(buf), 1)).from_buffer(buf) if buf else None
-        m.buf = ctypes.cast(arr, ctypes.POINTER(ctypes.c_uint8)) if arr else None
-        msgs = (i2c_msg * 1)(m)
-        rd = i2c_rdwr_ioctl_data(ctypes.cast(msgs, ctypes.POINTER(i2c_msg)), 1)
+    def _run(self, msgs, bufs):
+        """msgs/bufs 可以是单个，也可以是等长列表。一次 ioctl = 一次完整事务。"""
+        if not isinstance(msgs, list):
+            msgs, bufs = [msgs], [bufs]
+        keep = []
+        for m, buf in zip(msgs, bufs):
+            arr = (ctypes.c_uint8 * max(len(buf), 1)).from_buffer(buf) if buf else None
+            keep.append(arr)
+            m.buf = ctypes.cast(arr, ctypes.POINTER(ctypes.c_uint8)) if arr else None
+        arr_msgs = (i2c_msg * len(msgs))(*msgs)
+        rd = i2c_rdwr_ioctl_data(
+            ctypes.cast(arr_msgs, ctypes.POINTER(i2c_msg)), len(msgs))
         try:
             fcntl.ioctl(self.fd, I2C_RDWR, rd)
             return None
         except OSError as e:
             return e.errno
+
+    def xfer(self, wr, nread):
+        """单事务『写 wr 若干字节 + 重复起始 + 读 nread 字节』。
+
+        这正是 24 系列 EEPROM 的『随机地址读』：
+            S + DevSel(W) + AddrH + AddrL + Sr + DevSel(R) + data... + P
+        若拆成 write()/read() 两次调用，中间会插入 STOP，地址指针随之复位，
+        这就是之前写地址总不生效的根因。
+        """
+        rbuf = bytearray(nread)
+        mw = i2c_msg(); mw.addr = self.addr; mw.flags = 0
+        mw.len = len(wr); mw.buf = None
+        mr = i2c_msg(); mr.addr = self.addr; mr.flags = I2C_M_RD
+        mr.len = nread; mr.buf = None
+        err = self._run([mw, mr], [bytearray(wr), rbuf])
+        return (None, err) if err else (bytes(rbuf), None)
 
     def write1(self, byte, addr=None):
         m = i2c_msg()
@@ -156,6 +200,59 @@ def health(bus):
         return False
     print("  对照组 0x60 -> errno=%r" % (err,))
     return False
+
+
+# ---------------------------------------------------------------------
+# 原子寻址读：经由模块的 NTAG_XFER ioctl
+#   与 ioctl _IOWR('N', 1, struct ntag_xfer_arg) 对应
+#   struct { u8 w[8]; u16 wlen; u16 rlen; u8 r[512]; }
+# ---------------------------------------------------------------------
+class XferArg(ctypes.Structure):
+    _fields_ = [
+        ("w", ctypes.c_uint8 * 8),
+        ("wlen", ctypes.c_uint16),
+        ("rlen", ctypes.c_uint16),
+        ("r", ctypes.c_uint8 * 512),
+    ]
+
+
+# _IOWR('N', 1, struct ntag_xfer_arg)：
+#   方向=读写(3) | 类型=524(结构体实际 sizeof) | 序号=1
+# 注意 size 字段必须用 sizeof(struct)=524 而不是 512，
+# 否则内核比对不上，ioctl 会返回 ENOTTY。
+NTAG_XFER = ((3 << 30) | (ctypes.sizeof(XferArg) << 16)
+             | (ord("N") << 8) | 1)
+
+assert NTAG_XFER == 0xC20C4E01, hex(NTAG_XFER)
+
+
+def atom_read(fd, addr, n=16):
+    """单事务『写 2 字节地址 + 重复起始 + 读 n 字节』。
+
+    这是 24 系列 EEPROM 的随机地址读。ioctl 在模块内部用
+    i2c_transfer 把两个 i2c_msg 一起提交，写与读之间是 Repeated START，
+    不会有 STOP，地址指针因此不会被复位。
+    """
+    if n > 512:
+        return (None, "too-long")
+    a = XferArg()
+    a.w[0] = (addr >> 8) & 0xFF
+    a.w[1] = addr & 0xFF
+    a.wlen = 2
+    a.rlen = n
+    t0 = time.time()
+    try:
+        fcntl.ioctl(fd, NTAG_XFER, bytearray(a))
+    except OSError as e:
+        err = getattr(e, "errno", "?")
+        print("      %04x  ioctl 失败 errno=%s（%.0f ms）"
+              % (addr, err, (time.time() - t0) * 1000))
+        return (None, err)
+    # ioctl 成功；内核已把实际读到的字节写回
+    raw = bytes(a.r[:a.rlen]) if a.rlen else b""
+    print("      %04x  -> %d 字节  %s"
+          % (addr, len(raw), raw.hex(" ") if raw else "(空)"))
+    return (raw, None)
 
 
 def seek_read(fd, addr, n=16):
@@ -206,6 +303,189 @@ def seek_read(fd, addr, n=16):
     if werr == 121:
         return ("nak", d)
     return ("wdone", d) if werr is not None else ("ok", d)
+
+
+IRQ_NAME = "ntag_nfc"
+
+
+def irq_total(name=IRQ_NAME):
+    """从 /proc/interrupts 取指定名字那一行的 CPU 计数之和。"""
+    try:
+        with open("/proc/interrupts", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.rstrip().endswith(name):
+                    head = line.split(":", 1)
+                    if len(head) != 2:
+                        continue
+                    total = 0
+                    for tok in head[1].split():
+                        if not tok.isdigit():
+                            break        # 计数列在控制器名之前
+                        total += int(tok)
+                    return total
+    except OSError:
+        pass
+    return -1
+
+
+def wait_events(fd, n=16, count=3, timeout=90.0):
+    """监听 RF 中断，每次中断后立刻读一帧。
+
+    这是 Windows 驱动的真实行为：ISR 里把挂起的读请求完成，用户态随即取数据。
+    我们的模块 ISR 只计数、不读，所以改成「轮询 /proc/interrupts 计数变化 -> 立刻 read」。
+    时序窗口很短，读得越快越可能抓到手机刚写进去的那一帧。
+    """
+    print("\n== 等待 RF 中断，中断后立即读 %d 字节 ==" % n)
+    base = irq_total()
+    if base < 0:
+        print("  /proc/interrupts 里找不到 %s —— 模块没绑定？" % IRQ_NAME)
+        return
+    print("  当前中断计数 = %d，请把手机贴到掌托右侧，每次触碰读一帧。" % base)
+    print("  最多等 %d 次（总超时约 %.0f 秒，Ctrl-C 可中断）。" % (count, timeout + count * timeout))
+    last = base
+    got = 0
+    deadline = time.time() + timeout * (count + 1)
+    while got < count and time.time() < deadline:
+        cur = irq_total()
+        if cur < 0:
+            print("  /proc/interrupts 读取失败，中止")
+            return
+        if cur > last:
+            delta = cur - last
+            last = cur
+            print("\n  [%s] 中断 +%d，立刻读："
+                  % (time.strftime("%H:%M:%S"), delta))
+            try:
+                d = os.read(fd, n)
+            except OSError as e:
+                err = getattr(e, "errno", "?")
+                print("    读失败 errno=%s" % err)
+                if err == 110:
+                    print("    -> 超时，适配器可能已 wedged，中止")
+                    return
+                continue
+            if not d:
+                print("    (空)")
+            else:
+                print("    %d 字节  %s" % (len(d), d.hex(" ")))
+                asc = "".join(chr(b) if 32 <= b < 127 else "." for b in d)
+                print("    ASCII: %s" % asc)
+                if d == b"\x00" * len(d):
+                    print("    -> 全零：FIFO 里没有数据")
+                else:
+                    print("    -> 非零！这是手机写进来的内容，重跑并去掉 --wait 抓完整帧")
+            got += 1
+        else:
+            time.sleep(0.004)
+    if got == 0:
+        print("\n  这段时间内没有中断。确认手机 NFC 已开、贴的位置对（掌托右侧）。")
+
+
+# ---------------------------------------------------------------- 中断帧
+# 与 driver/ntag_nfc.c 里的 struct ntag_isr_arg 严格对应
+#   __u32 events; __u32 len; __s32 status; __u64 ns; __u8 r[64];
+#   -> 偏移 events@0, len@4, status@8, (pad 4), ns@16, r@24，总计 88
+
+
+class IsrArg(ctypes.Structure):
+    _fields_ = [("events", ctypes.c_uint32),
+                ("len", ctypes.c_uint32),
+                ("status", ctypes.c_int32),
+                ("_pad", ctypes.c_uint32),
+                ("ns", ctypes.c_uint64),
+                ("r", ctypes.c_uint8 * 64)]
+
+
+ISR_SIZE = ctypes.sizeof(IsrArg)		# 88
+NTAG_GET_ISR = (2 << 30) | (ISR_SIZE << 16) | (ord("N") << 8) | 2
+
+
+def isr_watch(fd, count=3, timeout=120.0, want_bytes=None):
+    """等中断，读模块在中断里缓存下来的那一帧。
+
+    这比轮询 /proc/interrupts 精确得多：数据是中断线程当场从 FIFO 读的。
+    """
+    print("\n== 等 RF 中断，读中断里缓存的那一帧 ==")
+    print("  请把手机贴到掌托右侧，每次触碰会打印一帧。最多 %d 次。" % count)
+    a = IsrArg()
+    try:
+        fcntl.ioctl(fd, NTAG_GET_ISR, a)
+    except OSError as e:
+        print("  ioctl 失败: %s" % e)
+        print("  模块可能还是旧版本，重新 make && rmmod/insmod")
+        return
+    base = a.events
+    print("  当前累计帧数 = %d（每次触碰+1）" % base)
+    got, last_ns = 0, a.ns
+    deadline = time.time() + timeout
+    while got < count and time.time() < deadline:
+        try:
+            fcntl.ioctl(fd, NTAG_GET_ISR, a)
+        except OSError:
+            time.sleep(0.01)
+            continue
+        if a.ns and a.ns != last_ns:
+            last_ns = a.ns
+            got += 1
+            ts = time.strftime("%H:%M:%S")
+            print("\n  [%s] 第 %d 次中断，帧数 %d" % (ts, got, a.events))
+            print("    status=%d  长度=%d" % (a.status, a.len))
+            if a.status != 0:
+                print("    -> 中断里读失败（%s）。FIFO 可能是空的，"
+                      "或适配器已 wedged。" % errname(a.status))
+                if a.status == -110:
+                    return
+            elif a.len:
+                d = bytes(a.r[:a.len])
+                print("    %s" % d.hex(" "))
+                print("    ASCII: %s"
+                      % "".join(chr(b) if 32 <= b < 127 else "." for b in d))
+                if d == b"\x00" * len(d):
+                    print("    -> 全零：中断来了但 FIFO 里没有数据")
+                else:
+                    print("    -> 非零！这就是手机写进来的内容")
+                    if want_bytes:
+                        with open(want_bytes, "ab") as f:
+                            f.write(d)
+                        print("    -> 已追加到 %s" % want_bytes)
+        time.sleep(0.005)
+    if got == 0:
+        print("\n  这段时间没有中断。确认手机 NFC 已开、位置对（掌托右侧）。")
+
+
+def atom_scan(fd, n=16):
+    """在候选地址上做真正的单事务寻址读（写地址 + Sr + 读）。"""
+    addrs = [0x0000, 0x0004, 0x000C, 0x0010, 0x0020, 0x0040,
+             0x0080, 0x0100, 0x0200, 0x0300, 0x0380, 0x0390,
+             0x0398, 0x03B3, 0x03C0]
+    print("\n== 单事务『写地址 + 重复起始 + 读』==")
+    print("  关键：写与读在同一个 I2C 事务里，中间无 STOP。")
+    print("  判读：不同地址读到不同内容 => 寻址可用，可以直接读全片；")
+    print("        全部相同            => 地址被忽略（NC/FIFO 模式）")
+    seen = {}
+    for a in addrs:
+        d, err = atom_read(fd, a, n)
+        if d is None:
+            if err == 110:
+                print("      -> 超时，适配器已 wedged，中止")
+                break
+            continue
+        seen.setdefault(d, []).append(a)
+    print("\n  ---- 汇总 ----")
+    if not seen:
+        print("  一个都没读到")
+        return
+    if len(seen) == 1:
+        d = next(iter(seen))
+        print("  全部 %d 个地址读到同一段内容：" % len(addrs))
+        print("    %s" % (d.hex(" ") if d else "(空)"))
+        print("  => 写地址被忽略：接触口很可能在 NC(FIFO) 模式。")
+    else:
+        print("  读到 %d 种不同内容 => 寻址可用！" % len(seen))
+        for d, als in sorted(seen.items(), key=lambda kv: kv[1][0]):
+            print("    %s : %s"
+                  % (" ".join("%04x" % x for x in als[:6]),
+                     d.hex(" ") if d else "(空)"))
 
 
 def seek_scan(fd, n=16):
@@ -625,6 +905,12 @@ def main():
                     help="配合 --dev：连续多轮读，判断内容是否变化（区分 FIFO 空与真数据）")
     ap.add_argument("--rounds", type=int, default=32,
                     help="--sweep 的轮数，默认 32")
+    ap.add_argument("--isr", nargs="?", const=3, type=int, metavar="N",
+                    help="等 N 次中断并打印模块在中断里读回的帧（默认 3）")
+    ap.add_argument("--wait", nargs="?", const=3, type=int, metavar="N",
+                    help="监听 N 次 RF 中断（默认 3），每次中断后立刻读一帧")
+    ap.add_argument("--atom", action="store_true",
+                    help="单事务『写地址+重复起始+读』（需模块 NTAG_XFER ioctl）")
     ap.add_argument("--seek", action="store_true",
                     help="配合 --dev：在多个候选地址上做「写地址 + 读」，验证寻址是否可用")
     args = ap.parse_args()
@@ -656,6 +942,13 @@ def main():
             if args.sweep:
                 sweep_blocks(fd, args.rounds, args.chunk if args.chunk > 0 else 16)
                 return 0
+            if args.isr:
+                isr_watch(fd, args.isr, want_bytes=args.save)
+                return 0
+            if args.wait:
+                wait_events(fd, args.chunk if args.chunk > 0 else 16, args.wait)
+            if args.atom:
+                atom_scan(fd, args.chunk if args.chunk > 0 else 16)
             if args.seek:
                 seek_scan(fd, args.chunk if args.chunk > 0 else 16)
                 return 0

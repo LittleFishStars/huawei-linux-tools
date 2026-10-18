@@ -66,6 +66,8 @@
 #include <linux/ktime.h>
 #include <linux/atomic.h>
 #include <linux/sysfs.h>
+#include <linux/ioctl.h>
+#include <linux/types.h>
 
 #define NTAG_DRV_NAME	"ntag_nfc"
 #define NTAG_MAX_XFER	512
@@ -83,6 +85,17 @@ struct ntag_dev {
 	atomic_t		irq_count;
 	ktime_t			irq_last;
 	bool			irq_ok;
+
+	/* --- 中断里立刻读回的一帧 ---
+	 * Windows 驱动的做法：ISR 把挂起的读请求直接完成，用户态拿到的是
+	 * 刚被手机写进 FIFO 的那一帧。只计数不读会错过时序窗口，所以这里
+	 * 在中断线程里同步读一帧并缓存。
+	 */
+	u8			isr_buf[64];
+	size_t			isr_len;
+	u32			isr_events;	/* 成功读到数据的次数 */
+	int			isr_status;	/* 最近一次的返回值 */
+	ktime_t			isr_time;
 };
 
 static struct ntag_dev *ntag;
@@ -96,6 +109,14 @@ module_param(irq_type, int, 0644);
 MODULE_PARM_DESC(irq_type, "0=ACPI auto, 1=rising, 2=falling, 3=both");
 module_param(probe_on_load, bool, 0644);
 MODULE_PARM_DESC(probe_on_load, "装载时发 NCI CORE_RESET 探测 (默认 0；目标若是 NFC 标签切勿开启)");
+
+static unsigned int isr_read_len = 16;
+module_param(isr_read_len, uint, 0644);
+MODULE_PARM_DESC(isr_read_len, "中断里立刻读回的字节数 (默认 16，受芯片 FIFO 上限约束)");
+
+static bool isr_read_enable = true;
+module_param(isr_read_enable, bool, 0644);
+MODULE_PARM_DESC(isr_read_enable, "中断触发时立刻读一帧 (默认 1)");
 
 static unsigned int read_len = 32;
 module_param(read_len, uint, 0644);
@@ -170,9 +191,31 @@ static void ntag_hexdump(const char *tag, const u8 *buf, size_t len)
 static irqreturn_t ntag_irq_handler(int irq, void *data)
 {
 	struct ntag_dev *nd = data;
+	u16 n = isr_read_len;
+	int ret;
 
 	atomic_inc(&nd->irq_count);
 	nd->irq_last = ktime_get();
+
+	if (!isr_read_enable || !n)
+		return IRQ_HANDLED;
+	if (n > sizeof(nd->isr_buf))
+		n = sizeof(nd->isr_buf);
+
+	/* 线程化处理程序里可以睡眠，i2c_transfer 在这里是合法的 */
+	mutex_lock(&nd->lock);
+	ret = ntag_i2c_read(nd, nd->isr_buf, n, NULL, 0);
+	mutex_unlock(&nd->lock);
+
+	nd->isr_status = ret;
+	nd->isr_time = ktime_get();
+	if (!ret) {
+		nd->isr_len = n;
+		nd->isr_events++;
+	} else {
+		nd->isr_len = 0;
+	}
+
 	return IRQ_HANDLED;
 }
 
@@ -304,10 +347,85 @@ static ssize_t ntag_dev_write(struct file *fp, const char __user *ubuf,
 	return ret ? ret : (ssize_t)len;
 }
 
+/* ------------------------------------------------------------------
+ * 原子「寻址读」ioctl
+ *
+ * 为什么必须是原子：24 系列 EEPROM 的随机地址读要求
+ *     S + DevSel(W) + AddrH + AddrL + Sr + DevSel(R) + data... + P
+ * 写地址与读数据之间必须是「重复起始(Repeated START)」，不能有 STOP。
+ * 用户态先 write() 再 read() 是两次独立事务，中间必然插入 STOP，
+ * 芯片的地址计数器随之复位 —— 这正是之前写地址怎么都不生效的根因。
+ *
+ * 用法（C）:
+ *     struct ntag_xfer_arg a = { .wlen = 2, .rlen = 16 };
+ *     a.w[0] = addr >> 8; a.w[1] = addr & 0xff;
+ *     ioctl(fd, NTAG_XFER, &a);
+ * 成功返回 0，a.rlen 被改写为实际读到的字节数。
+ * ------------------------------------------------------------------ */
+#define NTAG_IOC_MAGIC	'N'
+struct ntag_xfer_arg {
+	__u8	w[8];		/* 先写出的字节（通常 2 字节地址） */
+	__u16	wlen;
+	__u16	rlen;		/* 入：想读多少；出：实际读到多少 */
+	__u8	r[NTAG_MAX_XFER];
+};
+
+#define NTAG_XFER	_IOWR(NTAG_IOC_MAGIC, 1, struct ntag_xfer_arg)
+
+/* 读取中断里缓存下来的那一帧 */
+struct ntag_isr_arg {
+	__u32	events;		/* 累计成功读到的帧数 */
+	__u32	len;		/* 出：最后一帧长度 */
+	__s32	status;		/* 出：最近一次读的返回值 */
+	__u64	ns;		/* 出：最近一次中断的时间戳(单调时钟 ns) */
+	__u8	r[64];
+};
+#define NTAG_GET_ISR	_IOR(NTAG_IOC_MAGIC, 2, struct ntag_isr_arg)
+
 static long ntag_dev_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 {
-	/* 目前只用 read/write；保留 ioctl 入口给后续 NCI 栈 */
-	return -ENOTTY;
+	struct ntag_dev *nd = fp->private_data;
+	struct ntag_xfer_arg a;
+	int ret;
+
+	switch (cmd) {
+	case NTAG_XFER:
+		if (copy_from_user(&a, (void __user *)arg, sizeof(a)))
+			return -EFAULT;
+		if (!a.wlen || a.wlen > sizeof(a.w) ||
+		    !a.rlen || a.rlen > NTAG_MAX_XFER)
+			return -EINVAL;
+
+		mutex_lock(&nd->lock);
+		ret = ntag_i2c_read(nd, a.r, a.rlen, a.w, a.wlen);
+		mutex_unlock(&nd->lock);
+		if (ret)
+			return ret;
+
+		if (copy_to_user((void __user *)arg, &a, sizeof(a)))
+			return -EFAULT;
+		return 0;
+
+	case NTAG_GET_ISR: {
+		struct ntag_isr_arg a;
+
+		memset(&a, 0, sizeof(a));
+		mutex_lock(&nd->lock);
+		a.events = nd->isr_events;
+		a.len = nd->isr_len;
+		a.status = nd->isr_status;
+		a.ns = ktime_to_ns(nd->isr_time);
+		if (nd->isr_len)
+			memcpy(a.r, nd->isr_buf, min_t(size_t, nd->isr_len, sizeof(a.r)));
+		mutex_unlock(&nd->lock);
+		if (copy_to_user((void __user *)arg, &a, sizeof(a)))
+			return -EFAULT;
+		return 0;
+	}
+
+	default:
+		return -ENOTTY;
+	}
 }
 
 static int ntag_dev_open(struct inode *ino, struct file *fp)
