@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import fcntl
 import os
 import struct
@@ -125,6 +126,13 @@ class KernelDevice:
             raise TransportError(
                 f"{self.path} 需要 root（模块把权限设为 0600）"
             ) from exc
+        except OSError as exc:
+            if exc.errno == errno.EBUSY:
+                raise TransportError(
+                    f"{self.path} 已被另一个进程占用（驱动只允许单开）："
+                    "先关掉其它 gdix51c0/fprintd 会话再试"
+                ) from exc
+            raise
 
     def close(self) -> None:
         if self._fd >= 0:

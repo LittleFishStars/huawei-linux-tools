@@ -88,8 +88,11 @@ def _print_missing_gpio_hint(info) -> None:
     if not info.reset_valid:
         print(
             "提示：_CRS 里没有可用的 GpioIo（复位脚）。这不一定会阻止采图：\n"
-            "  传感器在收到 RESET 命令（0x82 之前的 0xa2）后会自己软复位。\n"
-            "  若要试其他资源序号：sudo modprobe gdix51c0_fp reset_gpio_index=N"
+            "  传感器在收到 RESET 命令（0xa2）后会自己软复位。\n"
+            "  先用下面这条看 _CRS 里到底有哪些 GPIO 资源：\n"
+            "    cat /sys/bus/spi/devices/spi-GDIX51C0:00/resources\n"
+            "  [] 里的数字就是资源序号，用模块参数指定：\n"
+            "    sudo modprobe gdix51c0_fp reset_gpio_index=<序号>"
         )
     if not info.irq_gpio_valid:
         print(
@@ -101,7 +104,6 @@ def _print_missing_gpio_hint(info) -> None:
 
 def cmd_otp(args: argparse.Namespace) -> int:
     with Session(device_path=args.device) as sess:
-        sess.open()
         # 只跑前半段初始化，不碰 TLS
         sess._get_evk_version()
         sess._reset_sensor("otp-reset")

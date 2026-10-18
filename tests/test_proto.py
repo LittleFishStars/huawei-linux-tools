@@ -114,6 +114,44 @@ def test_stash_is_drained() -> None:
     assert io._stash == [], io._stash
 
 
+def test_session_open_is_idempotent() -> None:
+    """Session.open() 必须幂等。
+
+    回归：`with Session(...)` 的 __enter__ 已经调过一次 open()，调用方
+    再显式 open() 一次曾导致驱动侧 open 返回 EBUSY（驱动只允许单开）。
+    """
+    from gdix51c0 import session as sess_mod
+
+    class FakeKernelDevice:
+        def __init__(self, path):
+            self.path = path
+            self._fd = -1
+
+        def open(self):
+            if self._fd >= 0:
+                return
+            self._fd = 0
+
+        def info(self):
+            class Info:
+                chunk = 2048
+                irq = 0
+                irq_gpio_valid = 0
+            return Info()
+
+        def close(self):
+            self._fd = -1
+
+    orig = sess_mod.KernelDevice
+    sess_mod.KernelDevice = FakeKernelDevice
+    try:
+        with sess_mod.Session(device_path="/dev/null") as sess:
+            sess.open()  # 曾经在这里抛 EBUSY
+            sess.open()  # 再来一次也必须无事
+    finally:
+        sess_mod.KernelDevice = orig
+
+
 TESTS = [
     ("同 IRQ 窗口的 ACK+响应", test_same_irq_window),
     ("分离窗口的 ACK/响应", test_split_window),
@@ -121,6 +159,7 @@ TESTS = [
     ("总线空闲退避重试", test_idle_bus_retries),
     ("坏头当噪声跳过", test_bad_header_is_skipped),
     ("drain 清空停滞区", test_stash_is_drained),
+    ("Session.open 幂等", test_session_open_is_idempotent),
 ]
 
 

@@ -60,7 +60,7 @@ makepkg -si
 
 包做两件事：
 
-1. 把内核模块源码装到 `/usr/src/gdix51c0-fp-0.1.1/`，触发 DKMS 为每个已装
+1. 把内核模块源码装到 `/usr/src/gdix51c0-fp-0.1.2/`，触发 DKMS 为每个已装
    内核编译（pacman 的 dkms hook 自动执行）
 2. 把 `gdix51c0` 工具装到 `/usr/bin`，Python 包装进 site-packages
 
@@ -84,9 +84,10 @@ python3 /usr/share/doc/gdix51c0-fp/tests/test_proto.py   # 协议时序单测（
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `reset_gpio_index` | 0 | ACPI `_CRS` 里第几个 GpioIo 是复位脚 |
+| `reset_gpio_index` | 1 | `_CRS` 里 GPIO 资源的**全局**序号（GpioIo 与 GpioInt 数在一起）——复位脚 |
+| `reset_active_low` | -1 | 复位脚极性：-1=跟随 `_CRS`，0=高有效，1=低有效 |
 | `irq_resource_index` | 0 | `_CRS` 里第几个 GpioInt 是中断 |
-| `irq_gpio_index` | -1 | 额外把某个 GpioIo 当可读电平的中断脚 |
+| `irq_gpio_index` | -1 | 额外把某个 GpioIo 当可读电平的中断脚（同样是全局序号） |
 | `speed_hz` | 10000000 | SPI 时钟 |
 | `chunk_bytes` | 2048 | 单次 `spi_transfer` 上限 |
 

@@ -84,6 +84,14 @@ class Session:
         self.close()
 
     def open(self) -> None:
+        """打开设备。幂等：已经打开时直接返回。
+
+        驱动侧同一时刻只允许一个打开者（open 返回 EBUSY），因此这个
+        方法必须幂等 —— `with Session(...)` 的 __enter__ 已经调过一次，
+        调用方再显式 open() 一次不应该报 EBUSY。
+        """
+        if self.dev is not None:
+            return
         path = self.device_path or "/dev/gdix51c0"
         self.dev = KernelDevice(path)
         self.info = self.dev.info()

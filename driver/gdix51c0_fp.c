@@ -107,10 +107,11 @@ struct gdix51c0 {
 
 /* ---- 模块参数：跨机型兜底 ---- */
 
-static int reset_gpio_index = 0;
+static int reset_gpio_index = 1;
 module_param(reset_gpio_index, int, 0444);
 MODULE_PARM_DESC(reset_gpio_index,
-		 " _CRS 中 GpioIo 资源的序号（复位脚），默认 0");
+		 " _CRS 中 GPIO 资源的全局序号（GpioIo 与 GpioInt 数在一起），"
+		 "指向复位脚；默认 1 对应本机 [1]=GpioIo pins=140");
 
 static int irq_gpio_index = -1;
 module_param(irq_gpio_index, int, 0444);
@@ -126,9 +127,16 @@ static uint speed_hz = GDIX51C0_DEFAULT_SPEED_HZ;
 module_param(speed_hz, uint, 0444);
 MODULE_PARM_DESC(speed_hz, "SPI 时钟，默认 10000000 (10 MHz)");
 
-static bool reset_active_low;
-module_param(reset_active_low, bool, 0444);
-MODULE_PARM_DESC(reset_active_low, "复位脚低电平有效时置 1");
+/*
+ * 复位脚极性：-1 = 跟随 ACPI _CRS（默认），0 = 高电平有效，1 = 低电平有效。
+ *
+ * 不能简单默认 false —— 本机 _CRS 明确写的是 active-low，而映射表里的
+ * active_low 会覆盖 _CRS 的极性，默认 false 会把物理极性弄反。
+ */
+static int reset_active_low = -1;
+module_param(reset_active_low, int, 0444);
+MODULE_PARM_DESC(reset_active_low,
+		 "复位脚极性：-1=跟随 ACPI _CRS（默认），0=高有效，1=低有效");
 
 static uint chunk_bytes = GDIX51C0_DEFAULT_CHUNK;
 module_param(chunk_bytes, uint, 0444);
@@ -198,15 +206,17 @@ static int gdix51c0_xfer(struct gdix51c0 *gd, u8 *tx, u8 *rx, size_t len,
 
 static void gdix51c0_hw_reset(struct gdix51c0 *gd, u32 hold_us)
 {
-	int assert_level, deassert_level;
 
 	if (!gd->reset_valid)
 		return;
 
-	/* active_low：拉低是复位；否则拉低也算复位（这类传感器普遍如此） */
-	assert_level = gd->reset_active_low ? 1 : 0;
-	deassert_level = !assert_level;
-
+	/*
+	 * gpiod_set_value*() 设的是**逻辑值**，物理极已由描述符的
+	 * active_low 处理（先由 ACPI _CRS 的 polarity 提供，再用模块参数覆盖）。
+	 * 所以“复位有效”恒为逻辑 1，“释放”恒为逻辑 0 —— 不要再自己算反。
+	 */
+	const int assert_level = 1;
+	const int deassert_level = 0;
 	gpiod_set_value_cansleep(gd->reset_gpio, assert_level);
 	usleep_range(hold_us, hold_us + 1000);
 	gpiod_set_value_cansleep(gd->reset_gpio, deassert_level);
@@ -487,6 +497,7 @@ struct gdix51c0_crs_ctx {
 	unsigned int size;
 	unsigned int gpio_io_idx;
 	unsigned int gpio_int_idx;
+	unsigned int gpio_all_idx;   /* GpioIo+GpioInt 的全局序号 = crs_entry_index */
 };
 
 static void crs_emit(struct gdix51c0_crs_ctx *ctx, const char *fmt, ...)
@@ -517,10 +528,16 @@ static int crs_one_cb(struct acpi_resource *ares, void *data)
 	case ACPI_RESOURCE_TYPE_GPIO:
 		agpio = &ares->data.gpio;
 		if (agpio->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT) {
-			crs_emit(ctx, "[%u] GpioInt  pins=", ctx->gpio_int_idx++);
+			crs_emit(ctx, "[%u] GpioInt  pins=", ctx->gpio_all_idx);
 		} else {
-			crs_emit(ctx, "[%u] GpioIo   pins=", ctx->gpio_io_idx++);
+			crs_emit(ctx, "[%u] GpioIo   pins=", ctx->gpio_all_idx);
 		}
+		/* 全局序号就是 acpi_gpio_params.crs_entry_index 要填的值 */
+		ctx->gpio_all_idx++;
+		if (agpio->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT)
+			ctx->gpio_int_idx++;
+		else
+			ctx->gpio_io_idx++;
 		for (i = 0; i < agpio->pin_table_length; i++)
 			crs_emit(ctx, i ? ",%u" : "%u", agpio->pin_table[i]);
 		crs_emit(ctx, " %s %s",
@@ -583,9 +600,11 @@ static ssize_t resources_show(struct device *dev, struct device_attribute *attr,
 	if (ret < 0)
 		return sysfs_emit(buf, "_CRS 读取失败: %d\n", ret);
 
-	crs_emit(&ctx, "\n合计：GpioIo=%u GpioInt=%u\n",
-		 ctx.gpio_io_idx, ctx.gpio_int_idx);
-	crs_emit(&ctx, "模块参数：reset_gpio_index=%d irq_resource_index=%d irq_gpio_index=%d\n",
+	crs_emit(&ctx, "\n合计：GPIO 资源 %u 个（GpioIo=%u GpioInt=%u）\n",
+		 ctx.gpio_all_idx, ctx.gpio_io_idx, ctx.gpio_int_idx);
+	crs_emit(&ctx,
+		 "上面 [] 里的数字就是 crs_entry_index；当前模块参数："
+		 "reset_gpio_index=%d irq_resource_index=%d irq_gpio_index=%d\n",
 		 reset_gpio_index, irq_resource_index, irq_gpio_index);
 
 	return ctx.len;
@@ -617,6 +636,41 @@ ATTRIBUTE_GROUPS(gdix51c0);
 /* ------------------------------------------------------------------ */
 /* probe / remove                                                     */
 /* ------------------------------------------------------------------ */
+/* ---- ACPI _CRS 序号 -> GPIO 描述符 ----------------------------------
+ *
+ * 关键点：devm_gpiod_get_index(dev, NULL, idx, ...) 在 con_id == NULL 时
+ * 走的是 _DSD 属性查找（找名为 "gpios" 的属性），不是 _CRS 资源序号。
+ * 本机的 _CRS 里明明有 GpioIo pins=140，但因为没有 _DSD，所以那个调用
+ * 返回 -ENOENT。
+ *
+ * 要对 _CRS 里的第 N 个 GPIOn 资源取句柄，必须先通过
+ * devm_acpi_dev_add_driver_gpios() 注册一张映射表，表项里的
+ * crs_entry_index 就是资源序号。之后再用映射名去取。
+ *
+ * 注意 crs_entry_index 数的是 _CRS 里
+ * 所有 GPIO 资源（GpioIo + GpioInt 混在一起）的序号，
+ * 不是“第几个 GpioIo”。本机顺序是 [0]=GpioInt(pins=321)、
+ * [1]=GpioIo(pins=140)，所以复位脚的 crs_entry_index 是 1。
+ */
+
+/*
+ * 映射表必须在运行时填 —— crs_entry_index 取决于 _CRS 里 GPIO 资源的顺序，
+ * 不同机型可能不同。所以这里用非 const 的可写数组。
+ */
+static struct acpi_gpio_params gdix51c0_reset_gpio_params[] = {
+	{ 0, 0, false },
+};
+
+static struct acpi_gpio_params gdix51c0_irq_gpio_params[] = {
+	{ 0, 0, false },
+};
+
+static struct acpi_gpio_mapping gdix51c0_gpio_mappings[] = {
+	{ "reset-gpios", gdix51c0_reset_gpio_params, 1, 0 },
+	{ "irq-gpios", gdix51c0_irq_gpio_params, 1, 0 },
+	{ }
+};
+
 
 static int gdix51c0_setup_power_and_irq(struct gdix51c0 *gd)
 {
@@ -628,20 +682,47 @@ static int gdix51c0_setup_power_and_irq(struct gdix51c0 *gd)
 		return -ENODEV;
 	}
 
-	/* 复位脚：_CRS 里的 GpioIo 资源 */
-	gd->reset_gpio = devm_gpiod_get_index(gd->dev, NULL, reset_gpio_index,
-					      reset_active_low ?
-					      GPIOD_OUT_LOW : GPIOD_OUT_HIGH);
+	/*
+	 * 复位脚：先把 _CRS 里的资源序号映射成一个具名属性，再按名字取。
+	 *
+	 * 注意 reset_gpio_index 的语义变了：它现在是 _CRS 里 GPIO 资源的
+	 * 全局序号（GpioIo 与 GpioInt 数在一起），不是“第几个 GpioIo”。
+	 * 本机 _CRS： [0]=GpioInt pins=321、 [1]=GpioIo pins=140
+	 * 所以默认值取 1（默认见模块参数定义）。
+	 */
+	gdix51c0_reset_gpio_params[0].crs_entry_index = reset_gpio_index;
+	gdix51c0_reset_gpio_params[0].line_index = 0;
+	/*
+	 * active_low 在 acpi_gpio_params 里是覆盖位：只能改真/假，无法表达
+	 * “不覆盖”。所以 -1（默认）时只能取与 _CRS 一致的值。
+	 * 本机 _CRS 写的是 active-low，上游驱动与 Windows 也当低有效复位，
+	 * 所以 -1 暂按 true 处理；其它机型可用模块参数强制指定。
+	 */
+	gdix51c0_reset_gpio_params[0].active_low =
+		(reset_active_low < 0) ? true : (reset_active_low != 0);
+
+	ret = devm_acpi_dev_add_driver_gpios(gd->dev, gdix51c0_gpio_mappings);
+	if (ret)
+		dev_warn(gd->dev,
+			 "ACPI GPIO 映射注册失败: %d（复位可能不可用）\n", ret);
+
+	gd->reset_gpio = devm_gpiod_get_index(
+		gd->dev, "reset", 0,
+		gdix51c0_reset_gpio_params[0].active_low ? GPIOD_OUT_HIGH
+							: GPIOD_OUT_LOW);
 	if (IS_ERR(gd->reset_gpio)) {
 		ret = PTR_ERR(gd->reset_gpio);
 		gd->reset_gpio = NULL;
 		dev_warn(gd->dev,
-			 "复位脚解析失败 (index=%d, %d)，复位功能不可用\n",
+			 "复位脚解析失败 (crs_entry_index=%d, %d)，复位功能不可用\n",
 			 reset_gpio_index, ret);
 	} else {
 		gd->reset_valid = true;
-		dev_info(gd->dev, "复位脚就绪 (GpioIo #%d, active_low=%d)\n",
-			 reset_gpio_index, reset_active_low);
+		gd->reset_active_low = gdix51c0_reset_gpio_params[0].active_low ? 1 : 0;
+		dev_info(gd->dev,
+			 "复位脚就绪 (crs_entry_index=%d, active_low=%d)\n",
+			 reset_gpio_index,
+			 gdix51c0_reset_gpio_params[0].active_low ? 1 : 0);
 	}
 
 	/* 中断：_CRS 里的 GpioInt 资源 -> 真实 Linux irq */
@@ -665,8 +746,9 @@ static int gdix51c0_setup_power_and_irq(struct gdix51c0 *gd)
 
 	/* 可选：把某个 GpioIo 当可读电平的中断脚（调试用） */
 	if (irq_gpio_index >= 0) {
-		gd->irq_gpio = devm_gpiod_get_index(gd->dev, NULL,
-						    irq_gpio_index, GPIOD_IN);
+		gdix51c0_irq_gpio_params[0].crs_entry_index = irq_gpio_index;
+		gdix51c0_irq_gpio_params[0].line_index = 0;
+		gd->irq_gpio = devm_gpiod_get_index(gd->dev, "irq", 0, GPIOD_IN);
 		if (IS_ERR(gd->irq_gpio)) {
 			dev_warn(gd->dev, "irq_gpio_index=%d 解析失败\n",
 				 irq_gpio_index);
@@ -698,7 +780,7 @@ static int gdix51c0_probe(struct spi_device *spi)
 	gd->spi = spi;
 	gd->speed_hz = speed_hz;
 	gd->chunk = chunk_bytes ? chunk_bytes : GDIX51C0_DEFAULT_CHUNK;
-	gd->reset_active_low = reset_active_low ? 1 : 0;
+	/* gd->reset_active_low 稍后在 setup_power_and_irq 里按实际解析结果填 */
 	mutex_init(&gd->io_lock);
 	init_waitqueue_head(&gd->irq_wait);
 	spin_lock_init(&gd->irq_lock);
