@@ -173,7 +173,7 @@ MODULE_PARM_DESC(irq_enable, "1=注册中断（默认）；0=不注册，用于�
  * 记账但时钟不真正输出，MISO 恒为 0xff。xfer() 里已经逐次 resume，
  * 这个开关只是让状态更确定，便于排查。
  */
-static bool pm_keep_awake = true;
+static bool pm_keep_awake;
 module_param(pm_keep_awake, bool, 0444);
 MODULE_PARM_DESC(pm_keep_awake, "1=让 SPI 控制器保持 active（默认）");
 MODULE_PARM_DESC(irq_edge_trigger,
@@ -214,26 +214,23 @@ static irqreturn_t gdix51c0_irq_handler(int irq, void *data)
 /*
  * SPI 搬运。
  *
- * **必须显式管住 SPI 控制器的 runtime PM**。本机控制器的 power/control 是
- * auto，长时间没人用它就停在 suspended 状态（实测
- * /sys/devices/pci0000:00/0000:00:1e.2/power/runtime_status = suspended）。
- * 控制器挂起时，spi_sync 仍会在内核软件层"记账"（/proc/interrupts、
- * statistics 里的 bytes/messages 都照常增长、errors 还是 0），但时钟并没有
- * 真的打到引脚上，MISO 就恒为上拉的 0xff —— 看起来像"设备不应答"，
- * 实际是根本没在通信。
+ * **不要在这里自己调 pm_runtime_*。**
  *
- * 所以每次搬运前 pm_runtime_resume_and_get，搬运后 put；未使能 runtime PM
- * 的老内核/devicetree 情形下这两个调用是空操作，不影响可移植性。
+ * spi_sync() 内部（spi_controller_xfer / spi_transfer_one_message）已经对
+ * SPI 控制器做了 pm_runtime_get_sync / put 配对，控制器该醒的时候自然会醒。
+ *
+ * 之前这里加过 pm_runtime_resume_and_get(gd->dev)，结果是**整个传输通路
+ * 被堵死**：gd->dev 是 SPI 从设备，一旦它的 power.runtime_error 被置位，
+ * 内核 rpm_resume() 会直接返回 -EACCES，ioctl 就报 EACCES/EPERM。
+ * 实测表现为 gdix51c0 diag 里取 MISO 时抛
+ * PermissionError: [Errno 13] Permission denied。
+ * 那次改动把一个"看起来合理"的 PM 逻辑变成了硬故障。
  */
 static int gdix51c0_xfer(struct gdix51c0 *gd, u8 *tx, u8 *rx, size_t len,
 			 u32 speed_hz)
 {
 	size_t off = 0;
 	int ret;
-
-	ret = pm_runtime_resume_and_get(gd->dev);
-	if (ret < 0)
-		return ret;
 
 	while (off < len) {
 		struct spi_transfer xfer = { 0 };
@@ -251,14 +248,11 @@ static int gdix51c0_xfer(struct gdix51c0 *gd, u8 *tx, u8 *rx, size_t len,
 
 		ret = spi_sync(gd->spi, &msg);
 		if (ret < 0)
-			goto out;
+			return ret;
 
 		off += n;
 	}
-	ret = 0;
-out:
-	pm_runtime_put(gd->dev);
-	return ret;
+	return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -642,11 +636,18 @@ static ssize_t info_show(struct device *dev, struct device_attribute *attr,
 
 	return sysfs_emit(buf,
 			  "hid=%s irq=%d reset=%s irq_gpio=%s speed=%u chunk=%u "
-			  "spi_pm=%s\n",
+			  "spi_pm=%s ctlr_pm=%s\n",
 			  GDIX51C0_ACPI_HID, gd->irq,
 			  gd->reset_valid ? "yes" : "no",
 			  gd->irq_gpio ? "yes" : "no",
 			  gd->speed_hz, gd->chunk,
+			  /* 从设备自身的 PM 状态：unsupported 说明我们不能对它调
+			   * pm_runtime_resume_and_get（会返回 -EACCES），SPI 传输
+			   * 必须完全交给 spi_sync 内部去管。 */
+			  pm_runtime_enabled(gd->dev)
+				  ? (pm_runtime_active(gd->dev) ? "active"
+								: "suspended")
+				  : "unsupported",
 			  !gd->ctrl_dev ? "n/a"
 			  : (pm_runtime_active(gd->ctrl_dev) ? "active"
 							     : "suspended"));
@@ -1169,8 +1170,8 @@ static int gdix51c0_probe(struct spi_device *spi)
 	 * 传输；这里只是让控制器常驻 active，避免"访问前刚好挂起"的时序
 	 * 问题，也让调试时看到的状态是确定的。
 	 */
-	if (pm_keep_awake && spi->controller && spi->controller->dev.parent) {
-		struct device *ctlr = spi->controller->dev.parent;
+	if (pm_keep_awake && spi->controller) {
+		struct device *ctlr = &spi->controller->dev;
 
 		pm_runtime_get_noresume(ctlr);
 		gd->ctrl_dev = ctlr;

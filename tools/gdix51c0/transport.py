@@ -198,7 +198,19 @@ class KernelDevice:
             tx_buf=ctypes.addressof(tx_buf) if tx_buf else 0,
             rx_buf=ctypes.addressof(rx_buf),
         )
-        fcntl.ioctl(self.fd, IOC_XFER, req, True)
+        try:
+            fcntl.ioctl(self.fd, IOC_XFER, req, True)
+        except PermissionError as exc:
+            # ioctl 返回 -EACCES 被 Python 映射成 PermissionError，很容易被
+            # 误读成"权限不足"。实际最常见的是内核侧 runtime-PM 出错
+            # （dev->power.runtime_error 置位后 rpm_resume 直接返回 -EACCES），
+            # 与文件权限无关 —— 这时用 root 跑也一样失败。
+            raise TransportError(
+                f"{self.path} 的 SPI 传输被内核拒绝（EACCES）。"
+                "这不是文件权限问题：多半是设备 runtime-PM 进入错误态，"
+                "试 `cat /sys/bus/spi/devices/spi-GDIX51C0:00/power/runtime_error`，"
+                "或卸载重载模块。"
+            ) from exc
         return rx_buf.raw[:total]
 
     def reset(self, hold_us: int = 10_000) -> None:

@@ -335,7 +335,14 @@ def cmd_diag(args: argparse.Namespace) -> int:
             return dev.xfer(b"\xff" * n, n, 0).hex()
 
         print("\n-- 复位前 --")
-        print(f"  空闲 MISO  {idle_read()}")
+        try:
+            print(f"  空闲 MISO  {idle_read()}")
+        except Exception as exc:  # noqa: BLE001 - 诊断要尽量往下走
+            print(f"  读取失败：{exc}")
+            print("  传输通道本身不通，后面的时序测试已跳过。")
+            print("  先确认：cat /sys/bus/spi/devices/spi-GDIX51C0:00/"
+                  "power/runtime_error")
+            return 1
 
         # SPI 控制器自己记的传输统计：消息数涨、错误数不涨 = 控制器认为
         # 传输成功。这条能把"控制器没在发"和"发了但设备不理"分开。
