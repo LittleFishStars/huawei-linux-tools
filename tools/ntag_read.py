@@ -158,6 +158,65 @@ def health(bus):
     return False
 
 
+def probe_sizes(fd):
+    """探测 /dev/ntag_nfc 单次事务的最大可读字节数。
+
+    为什么不直接一次读 1024：手册 2.2.3 写明「双接口共享 32 字节 FIFO」。
+    若接触口处于 NC(Channel) 模式，单次读一旦超过 FIFO 容量，
+    芯片就会拉住 SCL 不放，表现为 -110 ETIMEDOUT，整条总线随之卡死。
+    所以必须先定界，再决定每次读多少。
+
+    探测顺序从小到大，遇到第一个失败即停（失败后适配器不可信）。
+    """
+    print("\n== 单次事务可读字节数探测 ==")
+    print("  %6s  %-22s %s" % ("字节", "结果", "内容 / 耗时"))
+    ok_max, wedged = 0, False
+    for n in (1, 2, 4, 8, 12, 15, 16, 17, 20, 24, 28, 31, 32, 33, 48, 64):
+        t0 = time.time()
+        try:
+            d = os.read(fd, n)
+            ms = (time.time() - t0) * 1000
+            if d:
+                print("  %6d  OK 读到 %-3d 字节      %.0f ms   %s"
+                      % (n, len(d), ms, d[:16].hex(" ")))
+                ok_max = max(ok_max, len(d))
+            else:
+                print("  %6d  读到 0 字节           %.0f ms" % (n, ms))
+        except OSError as e:
+            ms = (time.time() - t0) * 1000
+            err = getattr(e, "errno", "?")
+            print("  %6d  失败 errno=%-4s      %.0f ms" % (n, err, ms))
+            if err == ETIMEDOUT:
+                wedged = True
+                print("        -> 已超时，停止探测（此后适配器不可信）")
+                break
+
+    print("\n  单次事务最大成功字节数 = %d" % ok_max)
+    if ok_max == 0:
+        print("""
+  一个字节都没读到。按可能性排序：
+    1. 芯片内部指针已经读到 EEPROM 末尾，接触口不再吐数据
+       （手册 4.1.3.2：读操作后的停止条件才让 EEPROM 回到等待；
+         而本机写地址不生效，也就无法把指针拨回去）
+    2. 芯片正被 RF 场占用（手机贴在感应区上）
+    3. 芯片处于 NC 模式且 FIFO 已空
+  建议：把手机贴近 NFC 区域再立刻重跑本探测（RF 场可能重置 FIFO），
+        或 sudo modprobe -r ntag_nfc && sudo modprobe ntag_nfc 复位控制器""")
+    elif ok_max < 32:
+        print("  注意：上限 %d 字节 < 32，与手册的 32 字节 FIFO 一致，"
+              "说明接触口在 NC(Channel) 模式。\n"
+              "  后续读取必须按这个尺寸分块，且每块之间可能有边界伪影。"
+              % ok_max)
+    else:
+        print("  上限达到 %d 字节，接近或超过 FIFO 容量，接触口可能在 NT 模式。" % ok_max)
+
+    if wedged:
+        print("\n  适配器已 wedged，复位后重试：")
+        print("    sudo modprobe -r ntag_nfc")
+        print("    sudo insmod ~/Projects/lib/huawei-ntag0001-nfc/driver/ntag_nfc.ko probe_on_load=0")
+    return ok_max
+
+
 def self_check(img):
     """Type 2 Tag 自校验。返回 (得分, 命中的不变量列表)。"""
     score, notes = 0, []
@@ -398,6 +457,8 @@ def main():
     ap.add_argument("--file", metavar="PATH", help="离线分析之前保存的流")
     ap.add_argument("--dev", metavar="PATH", default=None,
                     help="从内核模块字符设备读；模块已绑定时用 --dev /dev/ntag_nfc")
+    ap.add_argument("--probe", action="store_true",
+                    help="配合 --dev：探测单次事务的最大可读字节数后退出")
     args = ap.parse_args()
 
     if args.file:
@@ -415,29 +476,43 @@ def main():
             print("  先装载模块：sudo insmod driver/ntag_nfc.ko probe_on_load=0")
             return 1
         try:
+            if args.probe:
+                probe_sizes(fd)
+                return 0
+            chunk = args.chunk if args.chunk > 0 else 16
+            print("  每次连续读 %d 字节（--chunk 可改；上限受芯片 FIFO 限制）" % chunk)
             buf = bytearray()
             t0 = time.time()
             while len(buf) < args.len:
                 try:
-                    chunk = os.read(fd, min(256, args.len - len(buf)))
+                    part = os.read(fd, min(chunk, args.len - len(buf)))
                 except OSError as e:
                     print("  偏移 0x%04x 处读失败: %s" % (len(buf), e))
+                    if getattr(e, "errno", None) == ETIMEDOUT:
+                        print("  -> 超过 FIFO 容量或指针已到末尾。"
+                              "先用 --probe 定界，或换更小的 --chunk")
                     break
-                if not chunk:
+                if not part:
+                    print("  偏移 0x%04x 处读到 0 字节（设备无数据）" % len(buf))
                     break
-                buf += chunk
-                if time.time() - t0 > 10:
-                    print("  超时防护触发（10 秒）")
+                buf += part
+                if time.time() - t0 > 30:
+                    print("  超时防护触发（30 秒），已读 %d 字节" % len(buf))
                     break
         finally:
             os.close(fd)
         data = bytes(buf)
-        how = "内核模块 %s" % args.dev
+        how = "内核模块 %s，每次 %d 字节" % (args.dev, chunk)
         print("  成功读到 %d 字节（%s）" % (len(data), how))
-        if args.save and data:
+        if not data:
+            print("\n  没读到任何数据，不进行解析。先跑：")
+            print("    sudo python3 ntag_read.py --dev %s --probe" % args.dev)
+            return 2
+        if args.save:
             with open(args.save, "wb") as f:
                 f.write(data)
             print("  已保存到 %s" % args.save)
+
     else:
         print("总线 /dev/i2c-%d   从地址 0x%02x" % (args.bus, args.addr))
         bus = Bus(args.bus, args.addr)
