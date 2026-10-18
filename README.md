@@ -114,6 +114,24 @@ GpioIo 一个都没有（`devm_gpiod_get_index` 返回 `-ENOENT`）。所以复�
 cat /sys/bus/spi/devices/spi-GDIX51C0:00/resources
 ```
 
+## 当前进展与未解问题
+
+已确认（2026-10-18，root 权限下用 libgpiod 实测）：
+
+- 驱动与协议栈本身工作正常：SPI 传输真实发生（`errors=0`、`bytes_tx == bytes_rx`）
+- 复位脚 `gpio-140`、中断脚 `gpio-321` 均由 ACPI `_CRS` 正确解析并接管
+- ACPI `_INI` 里有两次 `SHPO`（直接写 GPIO 寄存器置输出高），是 BIOS 的上电序列
+
+**未解**：
+
+- INT 引脚（321）持续以约 **1.2 kHz** 输出方波（上升沿/下降沿数量相当），
+  内部上拉/下拉都无法改变，且**与驱动是否加载无关**
+- MISO 恒为 `0xff`，SPI 控制器却报告每次传输都成功
+
+在同样的连接下，这台机器原生安装 Windows 时指纹可正常用于登录与密码验证，
+说明硬件本身完好。详见 [`analysis/live_measurements.md`](analysis/live_measurements.md)
+与 [`analysis/spba_acpi.asl`](analysis/spba_acpi.asl)。
+
 ## 与上游的关系
 
 协议细节参考了 [libfprint-goodix-spi](https://github.com/berkekbgz/libfprint-goodix-spi)

@@ -36,3 +36,6 @@ src/
 
 # 已构建的包（现成产物，方便直接 pacman -U）
 dist/
+
+# ACPI 原始转储（体积大，且可由 acpidump/iasl 随时重生成）
+analysis/acpi_dump/
