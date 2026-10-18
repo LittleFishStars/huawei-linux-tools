@@ -453,6 +453,84 @@ def isr_watch(fd, count=3, timeout=120.0, want_bytes=None):
         print("\n  这段时间没有中断。确认手机 NFC 已开、位置对（掌托右侧）。")
 
 
+MAP_EXTRA = list(range(0xFFF0, 0x10000))
+
+
+def map_read(bus, step=16, nread=1):
+    """按地址逐点读，找非零内容；同时检测同一地址重复读是否稳定。
+
+    这是判定「写地址到底有没有生效」的最终手段，三种结果区分得很清楚：
+      - 1024 个 EEPROM 地址里出现非零内容 => 寻址生效，可逐段读全片
+      - 全为零且同地址重复读内容不变     => 地址被忽略（NC 模式 / FIFO 空）
+      - 同地址重复读内容在变             => 指针在自动前移，地址无效
+
+    只读操作；唯一写出去的是 2 字节地址本身。
+    """
+    print("\n== 地址扫描（只读：每地址写 2 字节地址 + 读 %d 字节）==" % nread)
+
+    # 基线：不发地址的裸读，看内部指针当前落在哪。
+    # 注意必须从 16 字节往下试 —— 已知 >=17 字节会把 SCL 拉死，
+    # 之前这里写 32 字节导致刚复位好的适配器立刻又被打死。
+    for n in (16, 8, 4, 1):
+        d, err = bus.read(n)
+        if d is None:
+            print("  基线裸读 %d 字节失败 errno=%s" % (n, errname(err)))
+            if err == ETIMEDOUT and n <= 1:
+                print("  -> 适配器已卡死。先跑 tools/reset_bus.sh 复位控制器")
+                return
+            continue
+        print("  基线裸读 %d 字节: %s" % (n, d.hex(" ")))
+        break
+
+    addrs = list(range(0x0000, 0x0400, step)) + MAP_EXTRA
+    print("  将扫描：EEPROM 0x0000~0x03FF 步进 %d（%d 个）+ 寄存器 0xFFF0~0xFFFF（%d 个）"
+          % (step, len(range(0x0000, 0x0400, step)), len(MAP_EXTRA)))
+
+    hits, zeros, errs = [], 0, []
+    for i, a in enumerate(addrs):
+        d, err = bus.xfer(bytes([(a >> 8) & 0xFF, a & 0xFF]), nread)
+        if d is None:
+            errs.append((a, err))
+            if err == ETIMEDOUT:
+                print("  0x%04X 超时，适配器已卡死；已扫 %d 个，中止" % (a, i + 1))
+                break
+            continue
+        if any(d):
+            hits.append((a, d))
+        else:
+            zeros += 1
+
+    print("\n  == 扫描结果 ==")
+    print("  非零 %d 处，全零 %d 处，失败 %d 处" % (len(hits), zeros, len(errs)))
+    for a, d in hits[:80]:
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in d)
+        print("    0x%04X -> %-16s |%s|" % (a, d.hex(" "), asc))
+    if len(hits) > 80:
+        print("    ...（另有 %d 处非零，未列出）" % (len(hits) - 80))
+    if errs and len(errs) <= 10:
+        for a, e in errs:
+            print("    0x%04X 失败 errno=%s" % (a, e))
+
+    print("\n  == 同地址重复读（检测指针是否自动前移）==")
+    for a in (0x0000, 0x0010, 0x0390, 0xFFF7):
+        seq = []
+        for _ in range(3):
+            d, err = bus.xfer(bytes([(a >> 8) & 0xFF, a & 0xFF]), max(nread, 4))
+            seq.append(d.hex(" ") if d is not None else "err=%s" % err)
+        same = len(set(seq)) == 1
+        print("    0x%04X: %s   -> %s"
+              % (a, "  |  ".join(seq), "稳定" if same else "每次不同（指针在走）"))
+
+    print("\n  == 判读 ==")
+    if hits:
+        print("    出现非零内容 => **地址寻址可用**，按命中的地址逐段读整片。")
+    elif zeros:
+        print("    全部为零 => 写地址被忽略（NC 模式且 FIFO 为空），")
+        print("    或芯片处于未使能状态（需先写配置字）。")
+    else:
+        print("    一个都没读到。")
+
+
 def atom_scan(fd, n=16):
     """在候选地址上做真正的单事务寻址读（写地址 + Sr + 读）。"""
     addrs = [0x0000, 0x0004, 0x000C, 0x0010, 0x0020, 0x0040,
@@ -952,14 +1030,17 @@ def fetch(bus, want, chunk=0):
         return bytes(buf[:want]), "分块 %d 字节 x %d 次（有块边界，仅供参考）" \
             % (chunk, (want + chunk - 1) // chunk)
 
-    for n in (want, 1024, 512, 256, 128, 64, 32):
+    # 从大到小试，但 16 字节是已知能成功的上限，必须留在候选里：
+    # NC 模式下大读会把 SCL 拉死，不能因为大读失败就放弃小读。
+    for n in (want, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 1):
         if n < 1 or n > want:
             continue
         d, err = bus.read(n)
         if d is not None:
             return d, "一次连续读 %d 字节" % n
-        print("  %4d 字节失败 errno=%r" % (n, err))
-        if err == ETIMEDOUT:
+        print("  %4d 字节失败 errno=%s" % (n, errname(err)))
+        if err == ETIMEDOUT and n <= 16:
+            # 连 16 字节都超时，说明适配器真的死了，继续试无意义
             return None, err
     return None, None
 
@@ -973,6 +1054,10 @@ def main():
     ap.add_argument("--chunk", type=int, default=0,
                     help="分块读每次字节数，0=一次连续读（推荐，唯一事务）")
     ap.add_argument("--raw", action="store_true", help="只打原始流，不做解析")
+    ap.add_argument("--map", action="store_true",
+                    help="逐地址扫描找非零内容（判定写地址是否生效，只读）")
+    ap.add_argument("--step", type=int, default=16,
+                    help="--map 的 EEPROM 地址步进，默认 16")
     ap.add_argument("--save", metavar="PATH", help="保存原始流")
     ap.add_argument("--file", metavar="PATH", help="离线分析之前保存的流")
     ap.add_argument("--dev", metavar="PATH", default=None,
@@ -1075,7 +1160,11 @@ def main():
         try:
             print("\n== 0. 对照组 ==")
             if not health(bus):
+                print("  适配器已卡死。先跑 tools/reset_bus.sh 复位控制器，再重跑。")
                 return 1
+            if args.map:
+                map_read(bus, args.step)
+                return 0
             print("\n== 1. 读 %d 字节 ==" % args.len)
             data, how = fetch(bus, args.len, args.chunk)
         finally:
