@@ -53,10 +53,12 @@ def cmd_info(args: argparse.Namespace) -> int:
         print(f"中断电平  {'高' if dev.irq_level() else '低'}")
     else:
         print("中断电平  不可用（_CRS 里没有可读的 GpioIo）")
-    # 把 _CRS 里到底声明了哪些资源打出来。GPIO 解析失败时这是唯一
-    # 能定位到根因的信息（有几个 GpioIo、引脚号、极性）。
-    if not info.reset_valid or not info.irq_gpio_valid:
+    # 复位脚是必需项：拿不到时把 _CRS 全量打出来定位根因。
+    # irq_gpio 是可选调试功能（默认 -1 不启用），不在此列。
+    if not info.reset_valid:
         _print_missing_gpio_hint(info)
+        _dump_crs(args.device)
+    elif getattr(args, "verbose", False):
         _dump_crs(args.device)
     dev.close()
 
@@ -83,7 +85,7 @@ def _dump_crs(device: str) -> None:
 
 
 def _print_missing_gpio_hint(info) -> None:
-    """GPIO 资源缺失时给出下一步的排查建议。"""
+    """复位脚拿不到时给出下一步的排查建议。"""
     print()
     if not info.reset_valid:
         print(
@@ -93,12 +95,6 @@ def _print_missing_gpio_hint(info) -> None:
             "    cat /sys/bus/spi/devices/spi-GDIX51C0:00/resources\n"
             "  [] 里的数字就是资源序号，用模块参数指定：\n"
             "    sudo modprobe gdix51c0_fp reset_gpio_index=<序号>"
-        )
-    if not info.irq_gpio_valid:
-        print(
-            "提示：_CRS 里没有额外的 GpioIo 可读电平。中断本身已经可用\n"
-            "  （IRQ 非 0），所以收发不受影响；只是看不到 IRQ 当前是高还是低。\n"
-            "  读数时用轮询模式也会照常工作。"
         )
 
 
@@ -289,7 +285,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default=DEVICE_NODE, help=f"字符设备路径（默认 {DEVICE_NODE}）")
     sub = p.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("info", help="打印设备与驱动信息").set_defaults(func=cmd_info)
+    info_p = sub.add_parser("info", help="打印设备与驱动信息")
+    info_p.add_argument("-v", "--verbose", action="store_true",
+                        help="同时打印 _CRS 声明的全部资源")
+    info_p.set_defaults(func=cmd_info)
 
     sub.add_parser("otp", help="读取芯片 ID、OTP 与自校准 DAC").set_defaults(func=cmd_otp)
 
