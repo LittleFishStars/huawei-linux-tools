@@ -158,6 +158,62 @@ def health(bus):
     return False
 
 
+def sweep_blocks(fd, rounds=32, size=16):
+    """连续做 rounds 轮 size 字节读，逐轮打印并判断内容是否在变。
+
+    为什么需要这个：单次只读一次，无法区分两种截然不同的状态——
+      A. FIFO 里真的是这 16 字节（内容稳定）
+      B. FIFO 已空，芯片对任何读都返回 0x00（内容也稳定，但毫无信息）
+    差别在于「换一个时刻再读是否还是同样的 16 字节」。
+    若手机贴上后内容变了，说明数据来自 RF 侧，接触口只有 FIFO；
+    若永远一样的全零，说明指针停在空白区或 FIFO 恒空。
+    """
+    print("\n== 连续 %d 轮 x %d 字节 ==" % (rounds, size))
+    seen = []
+    for i in range(rounds):
+        t0 = time.time()
+        try:
+            d = os.read(fd, size)
+        except OSError as e:
+            print("  第 %d 轮失败: %s（errno=%s）"
+                  % (i, e, getattr(e, "errno", "?")))
+            break
+        ms = (time.time() - t0) * 1000
+        tag = ""
+        if seen and d == seen[-1]:
+            tag = "  (同上)"
+        elif seen:
+            tag = "  <-- 变了"
+        print("  %2d  %.0f ms  %s%s" % (i, ms, d.hex(" ") if d else "(0 字节)", tag))
+        seen.append(d)
+
+    if not seen:
+        print("  一轮都没成功")
+        return
+    uniq = []
+    for d in seen:
+        if d not in uniq:
+            uniq.append(d)
+    print("\n  共 %d 轮，%d 种不同内容" % (len(seen), len(uniq)))
+    if len(uniq) == 1 and uniq[0] == b"\x00" * len(uniq[0]):
+        print("""
+  全部是全零且内容恒不变 —— 两种可能：
+    1. FIFO 空（NC 模式，无 RF 场时主机读不到 EEPROM）
+    2. 指针停在 EEPROM 的空白区（0x3E8 之后本是全零）
+  区分方法：把手机解锁、NFC 打开后贴到感应区，在「贴着不拿走」的
+  状态下立刻重跑本命令。若内容变了 -> 是 FIFO + RF 数据；
+  若仍是全零 -> 指针位置问题。""")
+    elif len(uniq) == 1:
+        print("  内容稳定且非全零：这是真实数据（同一段 16 字节）")
+        print("  数据: %s" % uniq[0].hex(" "))
+        print("  ASCII: %s" % "".join(chr(c) if 32 <= c < 127 else "."
+                                     for c in uniq[0]))
+    else:
+        print("  内容在变化 —— FIFO 正在被写入，指针或数据源在动")
+        print("  首轮: %s" % uniq[0].hex(" "))
+        print("  末轮: %s" % uniq[-1].hex(" "))
+
+
 def probe_sizes(fd):
     """探测 /dev/ntag_nfc 单次事务的最大可读字节数。
 
@@ -459,6 +515,10 @@ def main():
                     help="从内核模块字符设备读；模块已绑定时用 --dev /dev/ntag_nfc")
     ap.add_argument("--probe", action="store_true",
                     help="配合 --dev：探测单次事务的最大可读字节数后退出")
+    ap.add_argument("--sweep", action="store_true",
+                    help="配合 --dev：连续多轮读，判断内容是否变化（区分 FIFO 空与真数据）")
+    ap.add_argument("--rounds", type=int, default=32,
+                    help="--sweep 的轮数，默认 32")
     args = ap.parse_args()
 
     if args.file:
@@ -478,6 +538,9 @@ def main():
         try:
             if args.probe:
                 probe_sizes(fd)
+                return 0
+            if args.sweep:
+                sweep_blocks(fd, args.rounds, args.chunk if args.chunk > 0 else 16)
                 return 0
             chunk = args.chunk if args.chunk > 0 else 16
             print("  每次连续读 %d 字节（--chunk 可改；上限受芯片 FIFO 限制）" % chunk)
