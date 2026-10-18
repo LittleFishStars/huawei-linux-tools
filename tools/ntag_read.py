@@ -51,6 +51,7 @@ import ctypes
 import fcntl
 import os
 import sys
+import time
 
 I2C_RDWR = 0x0707
 I2C_M_RD = 0x0001
@@ -395,12 +396,48 @@ def main():
     ap.add_argument("--raw", action="store_true", help="只打原始流，不做解析")
     ap.add_argument("--save", metavar="PATH", help="保存原始流")
     ap.add_argument("--file", metavar="PATH", help="离线分析之前保存的流")
+    ap.add_argument("--dev", metavar="PATH", default=None,
+                    help="从内核模块字符设备读；模块已绑定时用 --dev /dev/ntag_nfc")
     args = ap.parse_args()
 
     if args.file:
         data = open(args.file, "rb").read()
         how = "离线文件 %s" % args.file
         print("%s（%d 字节）" % (how, len(data)))
+    elif args.dev:
+        # 走内核模块的 /dev/ntag_nfc：模块已绑定 ACPI client，
+        # 此时用户态不能对 0x57 发 I2C_SLAVE（会 EBUSY），所以用模块的读接口
+        print("设备 %s" % args.dev)
+        try:
+            fd = os.open(args.dev, os.O_RDONLY)
+        except OSError as e:
+            print("  打不开 %s: %s" % (args.dev, e))
+            print("  先装载模块：sudo insmod driver/ntag_nfc.ko probe_on_load=0")
+            return 1
+        try:
+            buf = bytearray()
+            t0 = time.time()
+            while len(buf) < args.len:
+                try:
+                    chunk = os.read(fd, min(256, args.len - len(buf)))
+                except OSError as e:
+                    print("  偏移 0x%04x 处读失败: %s" % (len(buf), e))
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                if time.time() - t0 > 10:
+                    print("  超时防护触发（10 秒）")
+                    break
+        finally:
+            os.close(fd)
+        data = bytes(buf)
+        how = "内核模块 %s" % args.dev
+        print("  成功读到 %d 字节（%s）" % (len(data), how))
+        if args.save and data:
+            with open(args.save, "wb") as f:
+                f.write(data)
+            print("  已保存到 %s" % args.save)
     else:
         print("总线 /dev/i2c-%d   从地址 0x%02x" % (args.bus, args.addr))
         bus = Bus(args.bus, args.addr)
@@ -424,7 +461,6 @@ def main():
             with open(args.save, "wb") as f:
                 f.write(data)
             print("  已保存到 %s" % args.save)
-
     print("\n== 2. 原始流前 64 字节 ==")
     hexdump(data[:64], 0)
 

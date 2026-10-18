@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * ntag_nfc.c - 华为 NTAG0001 内置 NFC 控制器（SPB/I2C 挂载）Linux 适配驱动
+ * ntag_nfc.c - 华为 MateBook 内置 NFC（ACPI NTAG0001 / I2C 挂载）Linux 侧驱动
+ *
+ * 芯片识别（2026-10-18 逆向定论）
+ *   上海复旦微电子 FM11NT082C-NTCI
+ *   双界面 NFC Forum Type 2 标签 + Channel IC
+ *   8Kbit EEPROM = 1024 字节 = 64 block x 16 byte，用户区 888 字节
+ *   接触口 I2C 从地址 0x57（配置字节 EE 0x03B3，默认 7'b1010_111）
+ *   片内铭牌: EE 0x03B7 = "FMSH"，EE 0x0398 = 0x57
+ *
+ *   注意：这颗不是 NFC 控制器（不说 NCI），是标签；接触口实测写地址不生效
+ *   （自增指针 + 纯读），详见项目 README。
  *
  * 目标硬件
  *   机型     : Huawei MateBook X Pro 2023 (MRGF-XX)
@@ -12,13 +22,28 @@
  *   "i2c-NTAG0001:00"（见 /sys/bus/i2c/devices/），从地址与 GpioInt 中断号都写在
  *   ACPI 表里。绑上这个 client 就自动拿到这两样东西，不需要在代码里硬编码从地址。
  *
+ * 与用户态工具的配合（重要）
+ *   本模块一旦绑定，内核就不允许用户态再对 0x57 发 I2C_SLAVE
+ *   （会返回 EBUSY / Errno 16）。因此两种用法二选一：
+ *
+ *     A. 用模块：从 /dev/ntag_nfc 取原始流，不需要 /dev/i2c-0
+ *        sudo dd if=/dev/ntag_nfc bs=1 count=2048 of=/tmp/nfc.bin
+ *        python3 tools/ntag_read.py --file /tmp/nfc.bin
+ *
+ *     B. 用用户态工具：先卸掉模块释放地址
+ *        sudo rmmod ntag_nfc
+ *        sudo python3 tools/ntag_read.py
+ *
+ *   两种方式读到的都是同一份片上数据，结果一致。
+ *
  * 本驱动做四件事
- *   1. 绑定 ACPI\NTAG0001，打印从地址 / 中断号 / 控制器能力（逆向所需的关键事实）
- *   2. 提供 /dev/ntag_nfc：写 = 原始 I2C 写，读 = 原始 I2C 读（供协议逆向用）
- *   3. 注册中断：只记录次数与时间戳，不假设芯片的语义
- *   4. probe_on_load=1（默认）时按几种常见 NCI 帧格式发 CORE_RESET_CMD，
- *   4. 不主动写芯片：0x57 上极可能是一颗 NFC Forum Type 2 Tag（16 字节页），
- *      盲写会误改配置/锁定位。需要探测时用 probe_on_load=1 显式开启。
+ *   1. 绑定 ACPI\NTAG0001，打印从地址 / 中断号 / 控制器能力
+ *   2. 提供 /dev/ntag_nfc：read() = 一次连续读（无块边界，最干净）；
+ *      write() = 原始 I2C 写（默认不要用，标签已烧成只读）
+ *   3. 注册 FD 中断（irq 213）：只记录次数与时间戳，不假设芯片语义
+ *   4. 不主动写芯片；probe_on_load 默认 0，置 1 会发 NCI CORE_RESET，
+ *      而本芯片不说 NCI，此路径已作废。
+
  *
  * 构建:  make           (需要 linux-headers，Arch: pacman -S linux-headers)
  * 装载:  sudo insmod ntag_nfc.ko
@@ -486,5 +511,5 @@ static struct i2c_driver ntag_driver = {
 module_i2c_driver(ntag_driver);
 
 MODULE_AUTHOR("nfc-re");
-MODULE_DESCRIPTION("Huawei NTAG0001 (ACPI) NFC over I2C - 探针/适配驱动");
+MODULE_DESCRIPTION("Fudan Micro FM11NT082C (ACPI NTAG0001) NFC Type 2 tag over I2C");
 MODULE_LICENSE("GPL");
