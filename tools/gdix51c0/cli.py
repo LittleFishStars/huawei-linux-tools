@@ -349,8 +349,15 @@ def cmd_diag(args: argparse.Namespace) -> int:
         # SPI 控制器的 runtime PM 状态。挂起时 spi_sync 仍然记账但时钟
         # 不真正输出，MISO 恒为 0xff —— 看起来像设备不应答。
         print("\n-- SPI 控制器电源状态 --")
+        # info 里挑出 spi_pm/ctlr_pm 两个字段，整行照抄没什么信息量
+        try:
+            with open("/sys/bus/spi/devices/spi-GDIX51C0:00/info") as fp:
+                for field in fp.read().split():
+                    if field.startswith(("spi_pm=", "ctlr_pm=")):
+                        print(f"  {field}")
+        except OSError as exc:
+            print(f"  spi_pm 读不到（{exc}）")
         for label, path in (
-            ("设备 spi_pm", "/sys/bus/spi/devices/spi-GDIX51C0:00/info"),
             ("控制器", "/sys/devices/pci0000:00/0000:00:1e.2/power/runtime_status"),
             ("控制器 control", "/sys/devices/pci0000:00/0000:00:1e.2/power/control"),
         ):
@@ -436,6 +443,23 @@ def cmd_diag(args: argparse.Namespace) -> int:
             print(f"  +{(i + 1) * 50:3d}ms  中断={dev.irq_count():3d}  MISO={idle_read(32)}")
     finally:
         dev.close()
+
+    # GpioInt 若没声明 pull 配置，内核会原样保留 = 浮空输入。
+    # 浮空 + 双边沿 = 噪声风暴；与 MISO 全 ff 指向同一件事。
+    print("\n-- GpioInt 的 pull 配置 --")
+    try:
+        with open("/sys/bus/spi/devices/spi-GDIX51C0:00/resources") as fp:
+            for line in fp:
+                if "GpioInt" not in line:
+                    continue
+                print(f"  {line.strip()}")
+                if not any(t in line for t in ("pullup", "pulldown",
+                                               "nopull")):
+                    print("  ！没有声明 pull 配置 = 浮空输入。")
+                    print("     浮空 + 双边沿触发，正好产生上千次/秒的噪声风暴，")
+                    print("     而采样时又大多读到高电平。")
+    except OSError as exc:
+        print(f"  读不到（{exc}）")
 
     print("\n诊断结论：")
     print("  IRQ 在 /proc/interrupts 里计数狂涨 = 硬件层在产生边沿，与我们的")
