@@ -256,6 +256,17 @@ def cmd_diag(args: argparse.Namespace) -> int:
             print(f"  {label}  {a} → {b}  约 {r:.0f} 次/秒")
             return r
 
+        # 内核里实际生效的中断配置（sysfs 里那张表是 ACPI 声明的，
+        # 未必等于 request_irq 之后真正生效的类型）
+        for extra in ("irqinfo", "info"):
+            path = f"/sys/bus/spi/devices/spi-GDIX51C0:00/{extra}"
+            try:
+                with open(path) as fp:
+                    for line in fp.read().splitlines():
+                        print(f"[{extra}] {line}")
+            except OSError as exc:
+                print(f"[{extra}] 读不到（{exc}）")
+
         print("\n-- 空闲时的中断速率 --")
         idle_rate = rate("静止 0.5s")
         if idle_rate > 100:
@@ -268,6 +279,39 @@ def cmd_diag(args: argparse.Namespace) -> int:
 
         print("\n-- 复位前 --")
         print(f"  空闲 MISO  {idle_read()}")
+
+        # SPI 控制器自己记的传输统计：消息数涨、错误数不涨 = 控制器认为
+        # 传输成功。这条能把"控制器没在发"和"发了但设备不理"分开。
+        print("\n-- SPI 控制器统计 --")
+        stat_dir = "/sys/bus/spi/devices/spi-GDIX51C0:00/statistics"
+        try:
+            os.listdir(stat_dir)
+        except OSError as exc:
+            print(f"  读不到（{exc}）")
+        else:
+            for name in ("messages", "bytes", "bytes_tx", "bytes_rx",
+                         "transfers", "errors", "timedout"):
+                try:
+                    with open(f"{stat_dir}/{name}") as fp:
+                        print(f"  {name:10} {fp.read().strip()}")
+                except OSError:
+                    pass
+
+        print("\n-- 中断脚电平（连续采样，看线是不是一直拉着）--")
+        try:
+            samples = []
+            for _ in range(10):
+                samples.append(dev.irq_level())
+                time.sleep(0.05)
+            print(f"  10 次采样（每 50ms）= {samples}")
+            if all(v == 1 for v in samples):
+                print("  线一直 active：MCU 在持续请求，或者线是浮空的噪声源")
+            elif all(v == 0 for v in samples):
+                print("  线一直 inactive：MCU 什么都没说")
+            else:
+                print("  线在翻转：是真信号（不是浮空噪声）")
+        except OSError as exc:
+            print(f"  读不到 IRQ 电平（{exc}）")
 
         print("\n-- 硬复位 --")
         before = dev.irq_count()

@@ -31,6 +31,7 @@
 #include <linux/fs.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>		/* irq_get_irq_data / IRQ_TYPE_* 用于 irqinfo */
 #include <linux/ioctl.h>
 #include <linux/jiffies.h>
 #include <linux/miscdevice.h>
@@ -504,7 +505,7 @@ static long gdix51c0_unlocked_ioctl(struct file *file, unsigned int cmd,
 		info.reset_active_low = gd->reset_active_low ? 1 : 0;
 		info.speed_hz = gd->speed_hz;
 		info.chunk = gd->chunk;
-		info.irq_gpio_valid = gd->irq_gpio ? 1 : 0;
+		info.irq_gpio_valid = (gd->irq_gpio || gd->irq_desc) ? 1 : 0;
 		if (copy_to_user(uarg, &info, sizeof(info)))
 			return -EFAULT;
 		return 0;
@@ -518,9 +519,18 @@ static long gdix51c0_unlocked_ioctl(struct file *file, unsigned int cmd,
 		return 0;
 
 	case GDIX51C0_IOC_IRQ_LEVEL:
-		if (!gd->irq_gpio)
+		/*
+		 * 优先用专门的电平脚；没有的话就用中断脚本身的描述符
+		 * （irq_desc 是以 GPIOD_IN 请求的，本来就能读电平）。
+		 *
+		 * 这个能力很关键：官方 irq_wait 是"先查电平，已在目标电平
+		 * 就不再等一个已经过去的边沿"。只靠计数的话，在线一直
+		 * active（中断风暴）时等待会永远立即返回，语义完全失效。
+		 */
+		if (!gd->irq_gpio && !gd->irq_desc)
 			return -ENODEV;
-		val = gpiod_get_value_cansleep(gd->irq_gpio) ? 1 : 0;
+		val = gpiod_get_value_cansleep(gd->irq_gpio ? gd->irq_gpio
+							    : gd->irq_desc) ? 1 : 0;
 		if (copy_to_user(uarg, &val, sizeof(val)))
 			return -EFAULT;
 		return 0;
@@ -662,6 +672,12 @@ static int crs_one_cb(struct acpi_resource *ares, void *data)
 			crs_emit(ctx, " src=%.*s",
 				 agpio->resource_source.string_length,
 				 agpio->resource_source.string_ptr);
+		/* io_restriction 说明这根线是被当成输入还是输出用的 ——
+		 * 若复位脚写着 InputOnly，那它就不是复位脚。 */
+		if (agpio->io_restriction == ACPI_IO_RESTRICT_INPUT)
+			crs_emit(ctx, " 仅输入");
+		else if (agpio->io_restriction == ACPI_IO_RESTRICT_OUTPUT)
+			crs_emit(ctx, " 仅输出");
 		if (agpio->pin_config == ACPI_PIN_CONFIG_PULLUP)
 			crs_emit(ctx, " pullup");
 		else if (agpio->pin_config == ACPI_PIN_CONFIG_PULLDOWN)
@@ -780,10 +796,92 @@ static ssize_t irq_count_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(irq_count);
 
+/*
+ * 把中断的实际生效状态打进内核日志。
+ *
+ * 为什么一定要读回：request_irq() 里传的 IRQF_TRIGGER_* 只是"请求"，
+ * 真正写进中断控制器的是 irq_set_irq_type()。若底层 gpio-irq chip 不
+ * 支持改类型、或者 ACPI 枚举阶段已把类型定死，请求会被静默保留成原样。
+ * 那样"我明明改成边沿了"就是假象 —— 必须读 irqd_get_trigger_type 验证。
+ */
+static void gdix51c0_log_irq_state(struct gdix51c0 *gd, const char *when)
+{
+	struct irq_data *d = irq_get_irq_data(gd->irq);
+	const char *chip = "?";
+	u32 trig = 0;
+	unsigned int parent = 0;
+
+	if (d) {
+		trig = irqd_get_trigger_type(d);
+		if (irq_data_get_irq_chip(d) && irq_data_get_irq_chip(d)->name)
+			chip = irq_data_get_irq_chip(d)->name;
+		parent = d->parent_data ? d->parent_data->irq : 0;
+	}
+
+	dev_info(gd->dev,
+		 "中断就绪 irq=%d chip=%s parent=%u %s trig=0x%x%s%s%s%s\n",
+		 gd->irq, chip, parent, when, trig,
+		 (trig & IRQ_TYPE_LEVEL_MASK) ? " LEVEL" : " EDGE",
+		 (trig & IRQ_TYPE_EDGE_RISING) ? " rising" : "",
+		 (trig & IRQ_TYPE_EDGE_FALLING) ? " falling" : "",
+		 (trig & IRQ_TYPE_LEVEL_HIGH) ? " high"
+		 : ((trig & IRQ_TYPE_LEVEL_LOW) ? " low" : ""));
+
+	if ((trig & IRQ_TYPE_LEVEL_MASK) && irq_edge_trigger)
+		dev_warn(gd->dev,
+			 "请求了边沿触发，但硬件仍是 LEVEL —— 这个 gpio-irq chip "
+			 "不接受改类型，中断风暴会继续\n");
+}
+
+/*
+ * 中断实况：irq 号、**当前实际生效的触发类型**、irq chip 名、电平、
+ * 以及父子中断号。
+ *
+ * 为什么要看这个：ACPI _CRS 把 GpioInt 声明成 level，而传感器是边沿
+ * 语义。request_irq 时传的 IRQF_TRIGGER_* 未必真的改到了硬件上
+ * （中断可能已被 ACPI 枚举阶段配过类型），光看现场"中断在飙"分不清
+ * 是"配成了 level"还是"线上真的有 1200 次/秒的边沿"。
+ */
+static ssize_t irqinfo_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct gdix51c0 *gd = dev_get_drvdata(dev);
+	struct irq_data *d;
+	u32 trig;
+	const char *chip = "?";
+	unsigned int parent = 0;
+	int level = -1;
+
+	if (!gd->irq)
+		return sysfs_emit(buf, "irq=0（未注册）\n");
+
+	d = irq_get_irq_data(gd->irq);
+	trig = d ? irqd_get_trigger_type(d) : 0;
+	if (d && irq_data_get_irq_chip(d) && irq_data_get_irq_chip(d)->name)
+		chip = irq_data_get_irq_chip(d)->name;
+	if (d)
+		parent = d->parent_data ? d->parent_data->irq : 0;
+	if (gd->irq_gpio || gd->irq_desc)
+		level = gpiod_get_value_cansleep(gd->irq_gpio ? gd->irq_gpio
+							      : gd->irq_desc) ? 1 : 0;
+
+	return sysfs_emit(buf,
+			  "irq=%d(0x%x) chip=%s parent=%u trig=0x%x %s%s%s%s level=%d\n",
+			  gd->irq, gd->irq, chip, parent, trig,
+			  (trig & IRQ_TYPE_LEVEL_MASK) ? "LEVEL" : "EDGE",
+			  (trig & IRQ_TYPE_EDGE_RISING) ? " rising" : "",
+			  (trig & IRQ_TYPE_EDGE_FALLING) ? " falling" : "",
+			  (trig & IRQ_TYPE_LEVEL_HIGH) ? " high"
+			  : ((trig & IRQ_TYPE_LEVEL_LOW) ? " low" : ""),
+			  level);
+}
+static DEVICE_ATTR_RO(irqinfo);
+
 static struct attribute *gdix51c0_attrs[] = {
 	&dev_attr_info.attr,
 	&dev_attr_resources.attr,
 	&dev_attr_irq_count.attr,
+	&dev_attr_irqinfo.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(gdix51c0);
@@ -944,7 +1042,7 @@ static int gdix51c0_setup_power_and_irq(struct gdix51c0 *gd)
 				 gd->irq, ret);
 			gd->irq = 0;
 		} else {
-			dev_info(gd->dev, "中断就绪 irq=%d\n", gd->irq);
+			gdix51c0_log_irq_state(gd, "注册后");
 		}
 	}
 
