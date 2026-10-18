@@ -327,6 +327,20 @@ def cmd_diag(args: argparse.Namespace) -> int:
 
         # SPI 控制器自己记的传输统计：消息数涨、错误数不涨 = 控制器认为
         # 传输成功。这条能把"控制器没在发"和"发了但设备不理"分开。
+        # SPI 控制器的 runtime PM 状态。挂起时 spi_sync 仍然记账但时钟
+        # 不真正输出，MISO 恒为 0xff —— 看起来像设备不应答。
+        print("\n-- SPI 控制器电源状态 --")
+        for label, path in (
+            ("设备 spi_pm", "/sys/bus/spi/devices/spi-GDIX51C0:00/info"),
+            ("控制器", "/sys/devices/pci0000:00/0000:00:1e.2/power/runtime_status"),
+            ("控制器 control", "/sys/devices/pci0000:00/0000:00:1e.2/power/control"),
+        ):
+            try:
+                with open(path) as fp:
+                    print(f"  {label:14} {fp.read().strip()}")
+            except OSError as exc:
+                print(f"  {label:14} 读不到（{exc}）")
+
         print("\n-- SPI 控制器统计 --")
         stat_dir = "/sys/bus/spi/devices/spi-GDIX51C0:00/statistics"
         try:

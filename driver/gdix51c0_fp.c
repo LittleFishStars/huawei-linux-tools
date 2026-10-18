@@ -38,6 +38,7 @@
 #include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/pm_runtime.h>	/* SPI 控制器的 runtime PM（见 gdix51c0_xfer） */
 #include <linux/poll.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
@@ -163,6 +164,17 @@ module_param(irq_edge_trigger, bool, 0444);
 static bool irq_enable = true;
 module_param(irq_enable, bool, 0444);
 MODULE_PARM_DESC(irq_enable, "1=注册中断（默认）；0=不注册，用于判断风暴来源");
+
+/*
+ * 1 = 加载后一直把 SPI 控制器保持在 active（不自动挂起）。
+ *
+ * 本机控制器 power/control=auto，空闲即 suspend；挂起时 spi_sync 仍然
+ * 记账但时钟不真正输出，MISO 恒为 0xff。xfer() 里已经逐次 resume，
+ * 这个开关只是让状态更确定，便于排查。
+ */
+static bool pm_keep_awake = true;
+module_param(pm_keep_awake, bool, 0444);
+MODULE_PARM_DESC(pm_keep_awake, "1=让 SPI 控制器保持 active（默认）");
 MODULE_PARM_DESC(irq_edge_trigger,
 		 "中断用双边沿触发（默认 1，与官方驱动一致）；0 = 跟随 _CRS");
 static uint chunk_bytes = GDIX51C0_DEFAULT_CHUNK;
@@ -198,11 +210,29 @@ static irqreturn_t gdix51c0_irq_handler(int irq, void *data)
  * 的单段 transfer，不能用 spi_write 再 read 的半双工写法——后者会让图像数据
  * 错位（参考实现里有明确注释）。
  */
+/*
+ * SPI 搬运。
+ *
+ * **必须显式管住 SPI 控制器的 runtime PM**。本机控制器的 power/control 是
+ * auto，长时间没人用它就停在 suspended 状态（实测
+ * /sys/devices/pci0000:00/0000:00:1e.2/power/runtime_status = suspended）。
+ * 控制器挂起时，spi_sync 仍会在内核软件层"记账"（/proc/interrupts、
+ * statistics 里的 bytes/messages 都照常增长、errors 还是 0），但时钟并没有
+ * 真的打到引脚上，MISO 就恒为上拉的 0xff —— 看起来像"设备不应答"，
+ * 实际是根本没在通信。
+ *
+ * 所以每次搬运前 pm_runtime_resume_and_get，搬运后 put；未使能 runtime PM
+ * 的老内核/devicetree 情形下这两个调用是空操作，不影响可移植性。
+ */
 static int gdix51c0_xfer(struct gdix51c0 *gd, u8 *tx, u8 *rx, size_t len,
 			 u32 speed_hz)
 {
 	size_t off = 0;
 	int ret;
+
+	ret = pm_runtime_resume_and_get(gd->dev);
+	if (ret < 0)
+		return ret;
 
 	while (off < len) {
 		struct spi_transfer xfer = { 0 };
@@ -220,11 +250,14 @@ static int gdix51c0_xfer(struct gdix51c0 *gd, u8 *tx, u8 *rx, size_t len,
 
 		ret = spi_sync(gd->spi, &msg);
 		if (ret < 0)
-			return ret;
+			goto out;
 
 		off += n;
 	}
-	return 0;
+	ret = 0;
+out:
+	pm_runtime_put(gd->dev);
+	return ret;
 }
 
 /* ------------------------------------------------------------------ */
@@ -461,15 +494,27 @@ static long gdix51c0_ioctl_gpio_set(struct gdix51c0 *gd, unsigned long arg)
 
 static long gdix51c0_ioctl_gpio_get(struct gdix51c0 *gd)
 {
-	struct gpio_desc *desc;
 	int v;
 
-	desc = devm_gpiod_get_index(gd->dev, "reset", 0, GPIOD_IN);
-	if (IS_ERR(desc))
-		return PTR_ERR(desc);
+	/*
+	 * 如果手里已经握着这根线（IOC_GPIO_SET 带 hold），必须直接用它读。
+	 * 再申请一次同一个 line 会返回 -EBUSY，结果就是"写 1 读回 0"这种
+	 * 看起来像写入失败的假象。
+	 */
+	if (gd->reset_gpio) {
+		v = gpiod_get_value_cansleep(gd->reset_gpio);
+		return v;
+	}
 
-	v = gpiod_get_value_cansleep(desc);
-	devm_gpiod_put(gd->dev, desc);
+	{
+		struct gpio_desc *desc;
+
+		desc = devm_gpiod_get_index(gd->dev, "reset", 0, GPIOD_IN);
+		if (IS_ERR(desc))
+			return PTR_ERR(desc);
+		v = gpiod_get_value_cansleep(desc);
+		devm_gpiod_put(gd->dev, desc);
+	}
 	return v;
 }
 
@@ -595,11 +640,13 @@ static ssize_t info_show(struct device *dev, struct device_attribute *attr,
 	struct gdix51c0 *gd = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf,
-			  "hid=%s irq=%d reset=%s irq_gpio=%s speed=%u chunk=%u\n",
+			  "hid=%s irq=%d reset=%s irq_gpio=%s speed=%u chunk=%u "
+			  "spi_pm=%s\n",
 			  GDIX51C0_ACPI_HID, gd->irq,
 			  gd->reset_valid ? "yes" : "no",
 			  gd->irq_gpio ? "yes" : "no",
-			  gd->speed_hz, gd->chunk);
+			  gd->speed_hz, gd->chunk,
+			  pm_runtime_active(gd->dev) ? "active" : "suspended");
 }
 static DEVICE_ATTR_RO(info);
 
@@ -1107,6 +1154,20 @@ static int gdix51c0_probe(struct spi_device *spi)
 	spin_lock_init(&gd->irq_lock);
 	dev_set_drvdata(&spi->dev, gd);
 
+	/*
+	 * 让控制器不再自动挂起。
+	 *
+	 * power/control 默认是 auto，空闲就会 suspend；配合 xfer 里的
+	 * pm_runtime_resume_and_get 已经够用，但把 control 设成 on 能让
+	 * 调试时看到的控制器状态是确定的（不会因为两秒没访问就变 suspended，
+	 * 干扰判断）。pm_runtime_allow 在退出时恢复。
+	 */
+	pm_runtime_disable(&spi->dev);
+	pm_runtime_set_active(&spi->dev);
+	pm_runtime_enable(&spi->dev);
+	if (pm_keep_awake)
+		pm_runtime_get_noresume(&spi->dev);
+
 	spi->mode = SPI_MODE_0;
 	spi->bits_per_word = 8;
 	spi->max_speed_hz = gd->speed_hz;
@@ -1149,6 +1210,9 @@ static void gdix51c0_remove(struct spi_device *spi)
 	mutex_lock(&gdix51c0_singleton_lock);
 	if (gd) {
 		misc_deregister(&gdix51c0_miscdev);
+		if (pm_keep_awake)
+			pm_runtime_put_noidle(gd->dev);
+		pm_runtime_allow(gd->dev);
 		/* 卸载时把复位脚拉回“不复位”态（描述符可能已释放，故判空） */
 		if (gd->reset_gpio)
 			gpiod_set_value_cansleep(gd->reset_gpio, 0);

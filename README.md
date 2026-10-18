@@ -60,7 +60,7 @@ makepkg -si
 
 包做两件事：
 
-1. 把内核模块源码装到 `/usr/src/gdix51c0-fp-0.1.8/`，触发 DKMS 为每个已装
+1. 把内核模块源码装到 `/usr/src/gdix51c0-fp-0.1.9/`，触发 DKMS 为每个已装
    内核编译（pacman 的 dkms hook 自动执行）
 2. 把 `gdix51c0` 工具装到 `/usr/bin`，Python 包装进 site-packages
 
