@@ -487,6 +487,84 @@ def atom_scan(fd, n=16):
                   % (" ".join("%04x" % x for x in als[:6]),
                      d.hex(" ") if d else "(空)"))
 
+# ---------------------------------------------------------------------
+# 官方 FM11NC08I demo（Hi3861 nfc_demo）的寄存器表，地址 0xFFF0~0xFFFF。
+# 这是之前完全不知道的区域：唯一公开资料里的从地址就是 0xAE == 7bit 0x57。
+# ---------------------------------------------------------------------
+C08I_REGS = [
+    (0xFFF0, "FM327_FIFO",        "FIFO 数据口（读写都走这里）"),
+    (0xFFF1, "FIFO_FLUSH_REG",    "写任意值清空 FIFO"),
+    (0xFFF2, "FIFO_WORDCNT_REG",  "FIFO 内字节数（低 6 位）"),
+    (0xFFF3, "RF_STATUS_REG",     "RF 状态"),
+    (0xFFF4, "RF_TXEN_REG",       "写 0x55 触发非接触口回发数据"),
+    (0xFFF5, "RF_BAUD_REG",       "RF 速率"),
+    (0xFFF6, "RF_RATS_REG",       "RATS"),
+    (0xFFF7, "MAIN_IRQ_REG",      "主中断标志"),
+    (0xFFF8, "FIFO_IRQ_REG",      "FIFO 中断标志"),
+    (0xFFF9, "AUX_IRQ_REG",       "辅助中断标志"),
+    (0xFFFA, "MAIN_IRQ_MASK_REG", "主中断屏蔽"),
+    (0xFFFB, "FIFO_IRQ_MASK_REG", "FIFO 中断屏蔽"),
+    (0xFFFC, "AUX_IRQ_MASK_REG",  "辅助中断屏蔽"),
+    (0xFFFD, "NFC_CFG_REG",       "NFC 配置"),
+    (0xFFFE, "VOUT_CFG_REG",      "能量收集输出电压"),
+    (0xFFFF, "EE_WR_CTRL_REG",    "EEPROM 写控制"),
+]
+
+# MAIN_IRQ_REG(0xFFF7) 位定义，同样来自官方 demo 头文件。
+# 关键：若有事件位被置起，就证明芯片在「主动告诉我们发生了什么」，
+# 而我们之前只靠 GPIO 边沿计数，完全看不到这些信息。
+MAIN_IRQ_BITS = [
+    (0x80, "RF_PWON",  "RF 场上电"),
+    (0x40, "ACTIVE",   "卡片激活"),
+    (0x20, "RX_START", "开始接收"),
+    (0x10, "RX_DONE",  "接收完成"),
+    (0x08, "TX_DONE",  "发送完成"),
+    (0x04, "ARBIT",    "仲裁"),
+    (0x02, "FIFO",     "FIFO 水位事件"),
+    (0x01, "AUX",      "辅助事件（收到后需写 FIFO_FLUSH 清）"),
+]
+
+
+def reg_dump(fd):
+    """逐个读 0xFFF0~0xFFFF 寄存器并解释（需 NTAG_XFER 通路）。"""
+    print("\n== FM11NC08I 寄存器区 0xFFF0~0xFFFF（单事务寻址读 1 字节）==")
+    print("  地址    名称                 读值   说明")
+    vals = {}
+    for addr, name, desc in C08I_REGS:
+        d, err = atom_read(fd, addr, 1)
+        if d is None:
+            print("  0x%04X  %-20s  --     ioctl/读失败 errno=%s"
+                  % (addr, name, err))
+            if err == 110:
+                print("  -> 适配器已 wedged，中止")
+                break
+            continue
+        v = d[0] if d else 0
+        vals[addr] = v
+        print("  0x%04X  %-20s  0x%02X   %s" % (addr, name, v, desc))
+
+    mi = vals.get(0xFFF7)
+    if mi is not None:
+        print("\n  MAIN_IRQ_REG = 0x%02X 解码：" % mi)
+        hit = False
+        for bit, nm, desc in MAIN_IRQ_BITS:
+            if mi & bit:
+                print("    %-10s %s" % (nm, desc))
+                hit = True
+        if not hit:
+            print("    （无位置位）")
+
+    wc = vals.get(0xFFF2)
+    if wc is not None:
+        print("\n  FIFO_WORDCNT_REG = 0x%02X -> FIFO 内有 %d 字节"
+              % (wc, wc & 0x3F))
+
+    if vals and all(v == 0xFF for v in vals.values()):
+        print("\n  => 全部 0xFF：SDA 被拉高，无器件应答（地址不对或未上电）")
+    elif vals and all(v == 0x00 for v in vals.values()):
+        print("\n  => 全部 0x00：值可能是真的，也可能地址未生效")
+    elif len(set(vals.values())) > 1:
+        print("\n  => 读到多个不同值：**寻址确实生效**，寄存器区可访问！")
 
 def seek_scan(fd, n=16):
     """在多个候选地址上做「写地址 + 读」，判断寻址是否可用。"""
@@ -913,6 +991,8 @@ def main():
                     help="单事务『写地址+重复起始+读』（需模块 NTAG_XFER ioctl）")
     ap.add_argument("--seek", action="store_true",
                     help="配合 --dev：在多个候选地址上做「写地址 + 读」，验证寻址是否可用")
+    ap.add_argument("--regs", action="store_true",
+                    help="读 FM11NC08I 寄存器区 0xFFF0~0xFFFF 并解码中断位")
     args = ap.parse_args()
 
     if args.file:
@@ -947,6 +1027,9 @@ def main():
                 return 0
             if args.wait:
                 wait_events(fd, args.chunk if args.chunk > 0 else 16, args.wait)
+            if args.regs:
+                reg_dump(fd)
+                return 0
             if args.atom:
                 atom_scan(fd, args.chunk if args.chunk > 0 else 16)
             if args.seek:
