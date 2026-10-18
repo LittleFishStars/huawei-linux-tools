@@ -151,6 +151,47 @@ def test_session_open_is_idempotent() -> None:
     finally:
         sess_mod.KernelDevice = orig
 
+def test_gpio_pin_ioctl_encoding() -> None:
+    """pin ioctl：编号要对，参数编码 bit0=电平、bit1=保持。"""
+    import ctypes
+    import struct
+
+    from gdix51c0 import transport
+
+    calls: list[tuple[int, bytes]] = []
+
+    class FakeFcntl:
+        @staticmethod
+        def ioctl(fd, request, arg=None, mutate_flag=False):
+            calls.append((request, arg if isinstance(arg, bytes) else b""))
+            return 0
+
+    dev = object.__new__(transport.KernelDevice)
+    dev._fd = 7
+
+    real = transport.fcntl.ioctl
+    transport.fcntl.ioctl = FakeFcntl.ioctl
+    try:
+        dev.gpio_set(1, hold=True)
+        dev.gpio_set(0, hold=False)
+    finally:
+        transport.fcntl.ioctl = real
+
+    assert calls == [
+        (transport.IOC_GPIO_SET, struct.pack("<I", 0b11)),
+        (transport.IOC_GPIO_SET, struct.pack("<I", 0b00)),
+    ], calls
+
+    # 编号必须与内核头里的一致：magic 0xD1、nr 0x07/0x08、参数宽度 4 字节。
+    # 注意内核 _IOC 的位域是 (dir<<30)|(size<<16)|(type<<8)|nr，
+    # 所以 nr 在低 8 位，type 在 bit 8-15 —— 别弄反。
+    assert (transport.IOC_GPIO_SET >> 8) & 0xFF == 0xD1
+    assert (transport.IOC_GPIO_GET >> 8) & 0xFF == 0xD1
+    assert transport.IOC_GPIO_SET & 0xFF == 0x07
+    assert transport.IOC_GPIO_GET & 0xFF == 0x08
+    assert ((transport.IOC_GPIO_SET >> 16) & 0x3FFF) == ctypes.sizeof(ctypes.c_uint32)
+    assert ((transport.IOC_GPIO_GET >> 16) & 0x3FFF) == ctypes.sizeof(ctypes.c_uint32)
+
 
 TESTS = [
     ("同 IRQ 窗口的 ACK+响应", test_same_irq_window),
@@ -160,6 +201,7 @@ TESTS = [
     ("坏头当噪声跳过", test_bad_header_is_skipped),
     ("drain 清空停滞区", test_stash_is_drained),
     ("Session.open 幂等", test_session_open_is_idempotent),
+    ("pin ioctl 编码", test_gpio_pin_ioctl_encoding),
 ]
 
 

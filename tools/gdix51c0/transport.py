@@ -72,6 +72,8 @@ IOC_INFO = _IOC(IOC_READ, 0x03, _INFO_SIZE)
 IOC_IRQ_COUNT = _IOC(IOC_READ, 0x04, ctypes.sizeof(ctypes.c_uint64))
 IOC_IRQ_LEVEL = _IOC(IOC_READ, 0x05, ctypes.sizeof(ctypes.c_uint32))
 IOC_IRQ_WAIT = _IOC(IOC_READ | IOC_WRITE, 0x06, ctypes.sizeof(ctypes.c_uint32))
+IOC_GPIO_SET = _IOC(IOC_WRITE, 0x07, ctypes.sizeof(ctypes.c_uint32))
+IOC_GPIO_GET = _IOC(IOC_READ, 0x08, ctypes.sizeof(ctypes.c_uint32))
 
 
 @dataclass(frozen=True)
@@ -202,6 +204,20 @@ class KernelDevice:
     def reset(self, hold_us: int = 10_000) -> None:
         fcntl.ioctl(self.fd, IOC_RESET, struct.pack("<I", hold_us))
 
+    def gpio_set(self, level: int, hold: bool = False) -> None:
+        """手动驱动复位/使能脚（调试）。
+
+        ACPI 里 GpioIo 没标用途，可能是复位、电源使能或片选。配合
+        irq_count 的速率变化可以逐个试出哪一种是真相。
+        hold=True 时不释放请求，保持在这根线上。
+        """
+        fcntl.ioctl(self.fd, IOC_GPIO_SET, struct.pack("<I", (level & 1) | ((1 if hold else 0) << 1)))
+
+    def gpio_get(self) -> int:
+        """读复位/使能脚当前电平。"""
+        raw = ctypes.create_string_buffer(4)
+        fcntl.ioctl(self.fd, IOC_GPIO_GET, raw, True)
+        return struct.unpack("<I", raw.raw)[0]
     def irq_count(self) -> int:
         raw = ctypes.create_string_buffer(8)
         fcntl.ioctl(self.fd, IOC_IRQ_COUNT, raw, True)

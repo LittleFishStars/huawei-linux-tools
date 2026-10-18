@@ -60,7 +60,7 @@ makepkg -si
 
 包做两件事：
 
-1. 把内核模块源码装到 `/usr/src/gdix51c0-fp-0.1.4/`，触发 DKMS 为每个已装
+1. 把内核模块源码装到 `/usr/src/gdix51c0-fp-0.1.5/`，触发 DKMS 为每个已装
    内核编译（pacman 的 dkms hook 自动执行）
 2. 把 `gdix51c0` 工具装到 `/usr/bin`，Python 包装进 site-packages
 
@@ -72,6 +72,8 @@ makepkg -si
 sudo modprobe gdix51c0_fp     # 绑定 spi-GDIX51C0:00，创建 /dev/gdix51c0
 sudo gdix51c0 info            # 设备/中断/速率概览
 
+sudo gdix51c0 diag            # 裸总线诊断：MISO 原始字节 + 中断速率
+sudo gdix51c0 pin             # 试 GpioIo 的真实用途（复位/使能/片选）
 sudo gdix51c0 otp             # 芯片 ID、OTP、自校准 DAC
 sudo gdix51c0 provision --yes # 生成并部署 PSK（破坏性！）
 sudo gdix51c0 capture --wait -o ~/finger.pgm
@@ -88,6 +90,7 @@ python3 /usr/share/doc/gdix51c0-fp/tests/test_proto.py   # 协议时序单测（
 | `reset_active_low` | -1 | 复位脚极性：-1=跟随 `_CRS`，0=高有效，1=低有效 |
 | `irq_resource_index` | 0 | `_CRS` 里第几个 GpioInt 是中断 |
 | `irq_gpio_index` | -1 | 额外把某个 GpioIo 当可读电平的中断脚（同样是全局序号） |
+| `irq_edge_trigger` | 1 | 中断用**双边沿**触发（与官方驱动一致）。本机 `_CRS` 把 GpioInt 写成 level，按 level 配会在线上持续 active 时无限重触发（实测约 1200 次/秒）；设 0 可退回跟随 `_CRS` |
 | `speed_hz` | 10000000 | SPI 时钟 |
 | `chunk_bytes` | 2048 | 单次 `spi_transfer` 上限 |
 

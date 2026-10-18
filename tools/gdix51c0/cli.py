@@ -4,7 +4,8 @@
 子命令一览：
 
     info        打印设备与驱动信息（不需要 PSK）
-    diag        裸总线诊断：看 MISO 与中断计数
+    diag        裸总线诊断：看 MISO、中断速率与复位效果
+    pin         逐个试 GpioIo 的真实用途（复位/使能/片选）
     otp         打印芯片 ID、OTP 摘要与自校准 DAC
     provision   生成并部署一个新 PSK（破坏性，会覆盖传感器里的旧密钥）
     capture     采一帧指纹并存成 PGM/PNG
@@ -245,7 +246,22 @@ def cmd_diag(args: argparse.Namespace) -> int:
         print(f"ACPI HID   {info.hid}")
         print(f"IRQ        {info.irq}")
         print(f"复位 GPIO  {'有' if info.reset_valid else '无'}")
-        print(f"初始中断计数 {dev.irq_count()}")
+
+        def rate(label: str, seconds: float = 0.5) -> float:
+            """测中断速率。恒定的高速率 = 电平触发风暴。/秒"""
+            a = dev.irq_count()
+            time.sleep(seconds)
+            b = dev.irq_count()
+            r = (b - a) / seconds
+            print(f"  {label}  {a} → {b}  约 {r:.0f} 次/秒")
+            return r
+
+        print("\n-- 空闲时的中断速率 --")
+        idle_rate = rate("静止 0.5s")
+        if idle_rate > 100:
+            print("  ！空闲时中断就在飙：多半是电平触发风暴。")
+            print("     （_CRS 把 GpioInt 写成 level，传感器却是边沿语义）")
+            print("     重新加载模块加 irq_edge_trigger=1 应该消除。")
 
         def idle_read(n: int = 16) -> str:
             return dev.xfer(b"\xff" * n, n, 0).hex()
@@ -263,6 +279,7 @@ def cmd_diag(args: argparse.Namespace) -> int:
         if delta == 0:
             print("  ！复位后没有启动脉冲：MCU 可能未被复位，或中断脚不可用")
         print(f"  复位后 MISO {idle_read()}")
+        rate("复位后静止 0.5s", 0.5)
 
         print("\n-- prefix01 + 0xa8 --")
         dev.xfer(_wire.encode_outer_header(_wire.OUTER_WRITE, len(_proto.PREFIX01)), 0)
@@ -285,7 +302,57 @@ def cmd_diag(args: argparse.Namespace) -> int:
     finally:
         dev.close()
 
-    print("\n如果全程 MISO 都是 ff 且中断计数不动：复位极性/时刻不对，或 MCU 没上电。")
+    print("\n该看什么：")
+    print("  1) 空闲中断速率接近 0 → 正常；上千次/秒 → 电平触发风暴，")
+    print("     用 irq_edge_trigger=1 重新加载模块（默认已开）")
+    print("  2) 复位后中断计数应该 +1～几次（启动脉冲）；差 0 说明复位没生效")
+    print("  3) MISO 不再是 ff → 设备在驱动数据线，协议层可以继续")
+    return 0
+
+
+def cmd_pin(args: argparse.Namespace) -> int:
+    """逐个试 GpioIo 的真实用途（复位 / 电源使能 / 片选）。
+
+    背景：ACPI 里 GpioIo(140) 没标注用途，三种解释会导出完全相反的操作，
+    而它们的现场表现都是"总线无响应"。这个命令拉高/拉低后测中断速率与
+    MISO，哪个组合能让中断风暴停下、MISO 不再全是 ff，那个就是真相。
+    """
+    dev = KernelDevice(args.device)
+    try:
+        info = dev.info()
+        if not info.reset_valid:
+            print("复位脚没解析出来，无法试验。", file=sys.stderr)
+            return 1
+
+        def probe(label: str) -> None:
+            a = dev.irq_count()
+            time.sleep(0.4)
+            b = dev.irq_count()
+            miso = dev.xfer(b"\xff" * 16, 16, 0)
+            all_ff = miso == b"\xff" * 16
+            print(f"  {label}  中断 {(b - a) / 0.4:6.0f}/s  "
+                  f"MISO {'全 ff（无应答）' if all_ff else miso.hex()}")
+
+        print("复位脚初始电平", dev.gpio_get())
+        print("\n-- 释放（高阻，平台上拉接管）--")
+        dev.gpio_set(0, hold=False)
+        time.sleep(0.2)
+        probe("释放 ")
+
+        for level in (0, 1):
+            print(f"\n-- 保持逻辑 {level} 200ms 后 --")
+            dev.gpio_set(level, hold=True)
+            time.sleep(0.2)
+            probe(f"pin={level}")
+            print(f"     读回电平 {dev.gpio_get()}")
+
+        print("\n-- 恢复：释放回高阻 --")
+        dev.gpio_set(0, hold=False)
+    finally:
+        dev.close()
+
+    print("\n判断：哪种电平能让中断速率降到 0 且 MISO 不再全 ff，")
+    print("那一个就是让传感器工作的状态（若是电源使能，那就是'上电'）。")
     return 0
 
 
@@ -351,6 +418,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     diag_p = sub.add_parser("diag", help="裸总线诊断：看 MISO 与中断计数")
     diag_p.set_defaults(func=cmd_diag)
+
+    pin_p = sub.add_parser("pin", help="逐个试 GpioIo 的真实用途")
+    pin_p.set_defaults(func=cmd_pin)
 
     sub.add_parser("otp", help="读取芯片 ID、OTP 与自校准 DAC").set_defaults(func=cmd_otp)
 

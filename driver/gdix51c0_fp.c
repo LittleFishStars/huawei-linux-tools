@@ -78,6 +78,9 @@ struct gdix51c0_info {
 #define GDIX51C0_IOC_IRQ_COUNT	_IOR(GDIX51C0_IOC_MAGIC, 0x04, __u64)
 #define GDIX51C0_IOC_IRQ_LEVEL	_IOR(GDIX51C0_IOC_MAGIC, 0x05, __u32)
 #define GDIX51C0_IOC_IRQ_WAIT	_IOWR(GDIX51C0_IOC_MAGIC, 0x06, __u32)	/* in: 超时 ms；out: 新计数 */
+/* in: bit0=电平(1/0) bit1=保持(不释放) —— 调试用，手动驱动复位/使能脚 */
+#define GDIX51C0_IOC_GPIO_SET	_IOW(GDIX51C0_IOC_MAGIC, 0x07, __u32)
+#define GDIX51C0_IOC_GPIO_GET	_IOR(GDIX51C0_IOC_MAGIC, 0x08, __u32)
 
 /* 一次采图窗口内的静默期，默认 80 ms（见文件头 2)） */
 #define GDIX51C0_DEFAULT_SPEED_HZ	10000000U
@@ -90,6 +93,7 @@ struct gdix51c0 {
 
 	struct gpio_desc *reset_gpio;
 	struct gpio_desc *irq_gpio;
+	struct gpio_desc *irq_desc;	/* 中断脚描述符（用于边沿触发 irq） */
 	int irq;
 
 	struct mutex io_lock;		/* 串行化复位与 SPI 传输 */
@@ -138,6 +142,16 @@ module_param(reset_active_low, int, 0444);
 MODULE_PARM_DESC(reset_active_low,
 		 "复位脚极性：-1=跟随 ACPI _CRS（默认），0=高有效，1=低有效");
 
+/*
+ * 中断触发类型：1 = 双边沿（默认，与上游一致），0 = 跟随 _CRS 声明。
+ *
+ * 本机 _CRS 把 GpioInt 写成 level，而传感器是边沿语义。level 配法在
+ * 线一直 active 时会无限重触发（实测约 1200 次/秒）。默认强制双边沿。
+ */
+static bool irq_edge_trigger = true;
+module_param(irq_edge_trigger, bool, 0444);
+MODULE_PARM_DESC(irq_edge_trigger,
+		 "中断用双边沿触发（默认 1，与官方驱动一致）；0 = 跟随 _CRS");
 static uint chunk_bytes = GDIX51C0_DEFAULT_CHUNK;
 module_param(chunk_bytes, uint, 0444);
 MODULE_PARM_DESC(chunk_bytes, "单次 spi_transfer 上限，默认 2048");
@@ -386,6 +400,66 @@ out:
 	return ret;
 }
 
+/*
+ * 手动驱动复位脚（调试用）。
+ *
+ * ACPI 里 GpioIo(140) 没标注用途：可能是复位，也可能是电源使能或片选。
+ * 这三者导致完全相反的操作，而它们的现场表现都是"总线无响应"。这个口子
+ * 允许从用户态逐个试，配合 irq_count 的速率变化判断哪一种是真相
+ * ——若是电源使能，拉高后中断风暴会停、MISO 也不再是 ff。
+ *
+ * hold=1 时不释放请求，保持在这根线上（便于连续观察）；下次调用重新申请。
+ */
+static long gdix51c0_ioctl_gpio_set(struct gdix51c0 *gd, unsigned long arg)
+{
+	struct gpio_desc *desc;
+	int val, level, hold, ret;
+
+	if (!gd->reset_valid)
+		return -ENOTSUPP;
+
+	val = (int)arg;
+	level = val & 1;
+	hold = (val >> 1) & 1;
+
+	if (gd->reset_gpio) {
+		desc = gd->reset_gpio;
+	} else {
+		desc = devm_gpiod_get_index(gd->dev, "reset", 0, GPIOD_OUT_LOW);
+		if (IS_ERR(desc))
+			return PTR_ERR(desc);
+		gd->reset_gpio = desc;
+	}
+
+	gpiod_set_value_cansleep(desc, level);
+
+	if (!hold) {
+		devm_gpiod_put(gd->dev, gd->reset_gpio);
+		gd->reset_gpio = NULL;
+		return 0;
+	}
+
+	/* hold：留在输出模式，但不再由 hw_reset 自动释放 */
+	ret = gpiod_direction_output(desc, level);
+	if (ret)
+		dev_warn(gd->dev, "gpiod_direction_output 失败: %d\n", ret);
+	return 0;
+}
+
+static long gdix51c0_ioctl_gpio_get(struct gdix51c0 *gd)
+{
+	struct gpio_desc *desc;
+	int v;
+
+	desc = devm_gpiod_get_index(gd->dev, "reset", 0, GPIOD_IN);
+	if (IS_ERR(desc))
+		return PTR_ERR(desc);
+
+	v = gpiod_get_value_cansleep(desc);
+	devm_gpiod_put(gd->dev, desc);
+	return v;
+}
+
 static long gdix51c0_unlocked_ioctl(struct file *file, unsigned int cmd,
 				    unsigned long arg)
 {
@@ -409,6 +483,18 @@ static long gdix51c0_unlocked_ioctl(struct file *file, unsigned int cmd,
 		gdix51c0_hw_reset(gd, val);
 		mutex_unlock(&gd->io_lock);
 		return 0;
+
+	case GDIX51C0_IOC_GPIO_SET:
+		mutex_lock(&gd->io_lock);
+		ret = gdix51c0_ioctl_gpio_set(gd, arg);
+		mutex_unlock(&gd->io_lock);
+		return ret;
+
+	case GDIX51C0_IOC_GPIO_GET:
+		mutex_lock(&gd->io_lock);
+		ret = gdix51c0_ioctl_gpio_get(gd);
+		mutex_unlock(&gd->io_lock);
+		return ret;
 
 	case GDIX51C0_IOC_INFO:
 		memset(&info, 0, sizeof(info));
@@ -550,6 +636,7 @@ static int crs_one_cb(struct acpi_resource *ares, void *data)
 	struct acpi_resource_gpio *agpio;
 	struct acpi_resource_irq *airq;
 	struct acpi_resource_extended_irq *aeirq;
+	struct acpi_resource_spi_serialbus *aspi;
 	int i;
 
 	switch (ares->type) {
@@ -575,6 +662,16 @@ static int crs_one_cb(struct acpi_resource *ares, void *data)
 			crs_emit(ctx, " src=%.*s",
 				 agpio->resource_source.string_length,
 				 agpio->resource_source.string_ptr);
+		if (agpio->pin_config == ACPI_PIN_CONFIG_PULLUP)
+			crs_emit(ctx, " pullup");
+		else if (agpio->pin_config == ACPI_PIN_CONFIG_PULLDOWN)
+			crs_emit(ctx, " pulldown");
+		else if (agpio->pin_config == ACPI_PIN_CONFIG_NOPULL)
+			crs_emit(ctx, " nopull");
+		if (agpio->shareable)
+			crs_emit(ctx, " shared");
+		if (agpio->wake_capable)
+			crs_emit(ctx, " wake");
 		crs_emit(ctx, "\n");
 		break;
 
@@ -596,6 +693,34 @@ static int crs_one_cb(struct acpi_resource *ares, void *data)
 		crs_emit(ctx, " %s %s\n",
 			 gdix51c0_trigger_name(aeirq->triggering),
 			 gdix51c0_polarity_name(aeirq->polarity));
+		break;
+
+	case ACPI_RESOURCE_TYPE_SERIAL_BUS:
+		/*
+		 * SPI 描述符：片选号、速率、线制都在这里。此前只输出
+		 * "其它 type=19"，把最关键的信息漏掉了。
+		 */
+		if (ares->data.common_serial_bus.type ==
+		    ACPI_RESOURCE_SERIAL_TYPE_SPI) {
+			aspi = &ares->data.spi_serial_bus;
+			crs_emit(ctx,
+				 "SPI       cs=%u speed=%u Hz %s bits=%u %s %s"
+				 " polarity=%s slave=%s\n",
+				 aspi->device_selection,
+				 aspi->connection_speed,
+				 aspi->wire_mode == ACPI_SPI_4WIRE_MODE
+					? "4线" : "3线",
+				 aspi->data_bit_length,
+				 aspi->clock_polarity ? "CPOL=1" : "CPOL=0",
+				 aspi->clock_phase ? "CPHA=1" : "CPHA=0",
+				 aspi->device_polarity == ACPI_SPI_ACTIVE_LOW
+					? "cs降有效" : "cs升有效",
+				 aspi->slave_mode ? "是" : "否");
+		} else {
+			crs_emit(ctx,
+				 "SerialBus type=%u（非 SPI）\n",
+				 ares->data.common_serial_bus.type);
+		}
 		break;
 
 	default:
@@ -632,8 +757,10 @@ static ssize_t resources_show(struct device *dev, struct device_attribute *attr,
 		 ctx.gpio_all_idx, ctx.gpio_io_idx, ctx.gpio_int_idx);
 	crs_emit(&ctx,
 		 "上面 [] 里的数字就是 crs_entry_index；当前模块参数："
-		 "reset_gpio_index=%d irq_resource_index=%d irq_gpio_index=%d\n",
-		 reset_gpio_index, irq_resource_index, irq_gpio_index);
+		 "reset_gpio_index=%d irq_resource_index=%d irq_gpio_index=%d "
+		 "irq_edge_trigger=%d\n",
+		 reset_gpio_index, irq_resource_index, irq_gpio_index,
+		 irq_edge_trigger ? 1 : 0);
 
 	return ctx.len;
 }
@@ -696,6 +823,7 @@ static struct acpi_gpio_params gdix51c0_irq_gpio_params[] = {
 static struct acpi_gpio_mapping gdix51c0_gpio_mappings[] = {
 	{ "reset-gpios", gdix51c0_reset_gpio_params, 1, 0 },
 	{ "irq-gpios", gdix51c0_irq_gpio_params, 1, 0 },
+	{ "irq-level-gpios", gdix51c0_irq_gpio_params, 1, 0 },
 	{ }
 };
 
@@ -772,16 +900,45 @@ static int gdix51c0_setup_power_and_irq(struct gdix51c0 *gd)
 		}
 	}
 
-	/* 中断：_CRS 里的 GpioInt 资源 -> 真实 Linux irq */
-	gd->irq = acpi_dev_gpio_irq_get(adev, irq_resource_index);
-	if (gd->irq < 0) {
+	/*
+	 * 中断：_CRS 里的 GpioInt 资源 -> 真实 Linux irq。
+	 *
+	 * **但不能直接用 acpi_dev_gpio_irq_get 的触发类型**。本机 _CRS 写的是
+	 * GpioInt(..., level, ...)，而传感器用的是边沿语义（上游驱动
+	 * gpiod_line_settings_set_edge_detection(GPIOD_LINE_EDGE_BOTH)）。
+	 * 按 level 配的话，只要线保持 active 就一直重触发——实测中断风暴
+	 * 约 1200 次/秒，同时 MISO 全程 ff，等边沿的逻辑也彻底失效。
+	 *
+	 * 所以：用 gpiod 拿描述符 -> gpiod_to_irq 得到 irq 号 ->
+	 * 请求时显式用 IRQF_TRIGGER_RISING|FALLING 覆盖触发类型。
+	 */
+	gd->irq_desc = devm_gpiod_get_index(gd->dev, "irq", 0, GPIOD_IN);
+	if (IS_ERR(gd->irq_desc)) {
+		ret = PTR_ERR(gd->irq_desc);
+		gd->irq_desc = NULL;
 		dev_warn(gd->dev,
-			 "GpioInt 解析失败 (index=%d, %d)，只能用轮询模式\n",
-			 irq_resource_index, gd->irq);
-		gd->irq = 0;
+			 "中断脚取不到 (%d)，改用 acpi_dev_gpio_irq_get\n", ret);
+		gd->irq = acpi_dev_gpio_irq_get(adev, irq_resource_index);
+		if (gd->irq < 0) {
+			dev_warn(gd->dev, "GpioInt 解析失败 (%d)，只能用轮询\n",
+				 gd->irq);
+			gd->irq = 0;
+		}
 	} else {
-		ret = devm_request_irq(gd->dev, gd->irq, gdix51c0_irq_handler,
-				       0, "gdix51c0-fp", gd);
+		gd->irq = gpiod_to_irq(gd->irq_desc);
+		if (gd->irq < 0) {
+			dev_warn(gd->dev, "gpiod_to_irq 失败: %d\n", gd->irq);
+			gd->irq = 0;
+		}
+	}
+
+	if (gd->irq > 0) {
+		ret = devm_request_irq(
+			gd->dev, gd->irq, gdix51c0_irq_handler,
+			irq_edge_trigger
+				? (IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING)
+				: 0,
+			"gdix51c0-fp", gd);
 		if (ret) {
 			dev_warn(gd->dev, "request_irq(%d) 失败: %d\n",
 				 gd->irq, ret);
@@ -791,11 +948,15 @@ static int gdix51c0_setup_power_and_irq(struct gdix51c0 *gd)
 		}
 	}
 
-	/* 可选：把某个 GpioIo 当可读电平的中断脚（调试用） */
+	/*
+	 * 可选的第二个中断脚（调试用）：用独立的映射名，免得和上面那条
+	 * "irq" 描述符抢同一根线（重复请求会 EBUSY）。
+	 */
 	if (irq_gpio_index >= 0) {
 		gdix51c0_irq_gpio_params[0].crs_entry_index = irq_gpio_index;
 		gdix51c0_irq_gpio_params[0].line_index = 0;
-		gd->irq_gpio = devm_gpiod_get_index(gd->dev, "irq", 0, GPIOD_IN);
+		gd->irq_gpio = devm_gpiod_get_index(gd->dev, "irq-level", 0,
+						    GPIOD_IN);
 		if (IS_ERR(gd->irq_gpio)) {
 			dev_warn(gd->dev, "irq_gpio_index=%d 解析失败\n",
 				 irq_gpio_index);
