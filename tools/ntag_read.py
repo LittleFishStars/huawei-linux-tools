@@ -1015,35 +1015,52 @@ def analyse(img):
             cur = b""
 
 
+MAX_XFER_SAFE = 16   # 实测硬上限：单次 I2C 事务 >=17 字节必然 -110 并永久打死适配器
+
+
 def fetch(bus, want, chunk=0):
-    """读 want 字节。chunk=0 优先一次连续读（唯一事务，最干净）。
+    """读 want 字节。
+
+    硬约束（--probe 实测）：单次 I2C 事务读 1..16 字节都成功，17 字节起
+    必然 ETIMEDOUT(-110)，且把适配器打到必须复位才能再用。所以这里
+    **从不**发起大于 MAX_XFER_SAFE 的单次读 —— want 更大时自动改分块。
 
     返回 (data, note) 或 (None, errno)
     """
+    if chunk <= 0 and want > MAX_XFER_SAFE:
+        chunk = MAX_XFER_SAFE
+    if chunk > MAX_XFER_SAFE:
+        # 用户手填了危险值，强制夹紧，否则一次事务就把适配器打死
+        print("  [警告] --chunk %d 超过单事务上限 %d，已自动夹紧"
+              % (chunk, MAX_XFER_SAFE))
+        chunk = MAX_XFER_SAFE
     if chunk > 0:
         buf = bytearray()
+        nblk = 0
         while len(buf) < want:
             d, err = bus.read(chunk)
             if d is None:
+                print("  分块第 %d 次(%d 字节)失败 errno=%s"
+                      % (nblk + 1, chunk, errname(err)))
                 return None, err
             buf += d
-        return bytes(buf[:want]), "分块 %d 字节 x %d 次（有块边界，仅供参考）" \
-            % (chunk, (want + chunk - 1) // chunk)
+            nblk += 1
+        return (bytes(buf[:want]),
+                "分块 %d 字节 x %d 次（单事务上限 %d，本芯片唯一可行的读法）"
+                % (chunk, nblk, MAX_XFER_SAFE))
 
-    # 从大到小试，但 16 字节是已知能成功的上限，必须留在候选里：
-    # NC 模式下大读会把 SCL 拉死，不能因为大读失败就放弃小读。
-    for n in (want, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 1):
+    # 单次读，候选全部 <= MAX_XFER_SAFE，绝不试更大的
+    for n in (want, 8, 4, 1):
         if n < 1 or n > want:
             continue
         d, err = bus.read(n)
         if d is not None:
             return d, "一次连续读 %d 字节" % n
         print("  %4d 字节失败 errno=%s" % (n, errname(err)))
-        if err == ETIMEDOUT and n <= 16:
-            # 连 16 字节都超时，说明适配器真的死了，继续试无意义
+        if err == ETIMEDOUT and n <= 1:
+            # 连 1 字节都超时，适配器真的死了
             return None, err
     return None, None
-
 
 def main():
     ap = argparse.ArgumentParser(description="FM11NT082C 读取器（连续读 + 自校验定相位）")
