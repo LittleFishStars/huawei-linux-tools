@@ -4,7 +4,7 @@
 
 > 顺带回答标题里的问题：**不需要逆向移植——华为官方就发布过 Linux 版分享引擎
 > （Share Engine / Share Kit）。** 本仓库把它打包成一键构建，唯一的门槛是
-> `libsharekit.so` 需要用华为开发者账号（实名）从官网下载。
+> `libsharekit.so` 官方不发下载——要填合作调研表发邮件到 `devConnect@huawei.com` 申请（B2B 审核，个人基本不受理）。
 
 ## 现状
 
@@ -14,8 +14,8 @@
 | BlueZ 5.52 内部静态库自动编译 | ✅ `scripts/build.sh` 已自动化 |
 | 官方 demo vendored（Apache-2.0） | ✅ `vendor/huaweicodelabs-ShareEngine/` |
 | 一键构建（SDK 缺席时自动 stub） | ✅ `./scripts/build.sh` → `build/hwshare-rx` / `hwshare-dtx` |
-| 官方 `libsharekit.so` | ⏳ **需自行下载**（见下） |
-| 不等 SDK 的替代互传方案 | ✅ [docs/替代方案.md](docs/替代方案.md) |
+| 官方 `libsharekit.so` | ❌ **官方不发下载**，需邮件申请（见 §2，个人基本不可达） |
+| 不等 SDK 的替代互传方案（**推荐**） | ✅ [docs/替代方案.md](docs/替代方案.md) |
 
 ## 快速开始
 
@@ -27,12 +27,17 @@ sudo pacman -S --needed base-devel glib2 openssl
 ./build/hwshare-rx   # stub 模式下打印提示后退出，证明构建链 OK
 ```
 
-### 2. 获取官方 SDK（真正可用的一步）
+### 2. 获取官方 SDK（唯一卡点，且对个人基本关闭）
 
-1. 注册/登录[华为开发者账号](https://developer.huawei.com/consumer/en/)并完成实名认证；
-2. 打开 [Obtaining the Linux SDK](https://developer.huawei.com/consumer/en/doc/connectivity-Library/sdk-download-linux-0000001052056169)
-   下载 Share Engine Linux SDK；
-3. 解压后把 `libsharekit.so` 放进 `sdk/lib/x86_64/`，SDK 自带头文件放进 `sdk/include/`；
+官方页面 [Obtaining the Linux SDK](https://developer.huawei.com/consumer/en/doc/connectivity-Library/sdk-download-linux-0000001052056169)
+**没有下载按钮**，原文要求：
+
+1. 确认你的 app 与设备满足 Share Engine Integration specifications for Linux；
+2. 下载并填写 `HUAWEI Share Engine Project Cooperation Specifications Survey (new).xlsx`，
+   **发邮件到 `devConnect@huawei.com` 申请 SDK**（页面 `Last updated 2021-03-24`，SDK 版本 `1.0.0.100`）。
+
+这是项目级 B2B 审核（要填公司、项目、预期出货量），个人自用需求基本不被受理。
+拿到之后：把 `libsharekit.so` 放进 `sdk/lib/x86_64/`，头文件放进 `sdk/include/`，重跑 `./scripts/build.sh`；
 4. `./scripts/check-sdk.sh` 校验符号/架构；
 5. `./scripts/build.sh` 重新构建。
 
