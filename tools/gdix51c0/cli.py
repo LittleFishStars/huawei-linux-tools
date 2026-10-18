@@ -260,12 +260,16 @@ def cmd_diag(args: argparse.Namespace) -> int:
         # 内核里实际生效的中断配置（sysfs 里那张表是 ACPI 声明的，
         # 未必等于 request_irq 之后真正生效的类型）
         stale_module = False
+        line_irqinfo = ""
         for extra in ("irqinfo", "info"):
             path = f"/sys/bus/spi/devices/spi-GDIX51C0:00/{extra}"
             try:
                 with open(path) as fp:
-                    for line in fp.read().splitlines():
-                        print(f"[{extra}] {line}")
+                    text = fp.read()
+                if extra == "irqinfo":
+                    line_irqinfo = text
+                for line in text.splitlines():
+                    print(f"[{extra}] {line}")
             except FileNotFoundError:
                 if extra == "irqinfo":
                     stale_module = True
@@ -315,9 +319,17 @@ def cmd_diag(args: argparse.Namespace) -> int:
         print("\n-- 空闲时的中断速率 --")
         idle_rate = rate("静止 0.5s")
         if idle_rate > 100:
-            print("  ！空闲时中断就在飙：多半是电平触发风暴。")
-            print("     （_CRS 把 GpioInt 写成 level，传感器却是边沿语义）")
-            print("     重新加载模块加 irq_edge_trigger=1 应该消除。")
+            # 若触发类型已是 edge 而速率仍上千，那就不是"配成 level 造成的
+            # 重触发"，而是线上真的有海量边沿 —— 浮空引脚被噪声触发的典型
+            # 特征（传感器未上电时 INT 会浮空、被内部上拉拉高）。
+            is_edge = "EDGE" in line_irqinfo
+            if is_edge:
+                print("  ！触发类型已是 EDGE，但仍有上千次/秒的边沿。")
+                print("     这根线在真实翻转，不是软件重触发。结合 MISO 全 ff，")
+                print("     最可能是传感器未上电、INT 引脚浮空被噪声触发。")
+            else:
+                print("  ！触发类型是 LEVEL，空闲时就在飙 = 电平重触发。")
+                print("     用 irq_edge_trigger=1 重新加载模块。")
 
         def idle_read(n: int = 16) -> str:
             return dev.xfer(b"\xff" * n, n, 0).hex()
@@ -418,11 +430,16 @@ def cmd_diag(args: argparse.Namespace) -> int:
     finally:
         dev.close()
 
-    print("\n该看什么：")
-    print("  1) 空闲中断速率接近 0 → 正常；上千次/秒 → 电平触发风暴，")
-    print("     用 irq_edge_trigger=1 重新加载模块（默认已开）")
-    print("  2) 复位后中断计数应该 +1～几次（启动脉冲）；差 0 说明复位没生效")
-    print("  3) MISO 不再是 ff → 设备在驱动数据线，协议层可以继续")
+    print("\n诊断结论：")
+    print("  IRQ 在 /proc/interrupts 里计数狂涨 = 硬件层在产生边沿，与我们的")
+    print("  handler 无关（该计数在 handler 之前累加）。")
+    print("  若 trig 已是 EDGE 且电平恒为 1，说明这根线在浮空、被噪声触发；")
+    print("  配合 MISO 全 ff，最可能是传感器未上电或 INT/MISO 引脚未接通。")
+    print()
+    print("下一步（需要在 Windows 下确认）：")
+    print("  · 设备管理器里该传感器是否显示为正常启动")
+    print("  · Windows 休眠/关机后指纹是否还能唤醒（能唤醒=有常电）")
+    print("  · 是否有 BIOS 侧的指纹开关（部分 MateBook 在 BIOS 里可禁用）")
     return 0
 
 
