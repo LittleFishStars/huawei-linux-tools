@@ -151,6 +151,18 @@ MODULE_PARM_DESC(reset_active_low,
  */
 static bool irq_edge_trigger = true;
 module_param(irq_edge_trigger, bool, 0444);
+
+/*
+ * 0 = 完全不注册中断处理函数（调试用）。
+ *
+ * 用途：判断那 1190 次/秒到底是不是"我们的 handler 在重入"。
+ * 关掉之后 irq_count 若仍是 0，说明风暴是被我们的 handler 触发的重入；
+ * 若 /proc/interrupts 里该 irq 的计数还在涨，那是硬件/上游控制器在计数，
+ * 与我们无关 —— 两种结论指向完全不同的修法。
+ */
+static bool irq_enable = true;
+module_param(irq_enable, bool, 0444);
+MODULE_PARM_DESC(irq_enable, "1=注册中断（默认）；0=不注册，用于判断风暴来源");
 MODULE_PARM_DESC(irq_edge_trigger,
 		 "中断用双边沿触发（默认 1，与官方驱动一致）；0 = 跟随 _CRS");
 static uint chunk_bytes = GDIX51C0_DEFAULT_CHUNK;
@@ -1030,7 +1042,10 @@ static int gdix51c0_setup_power_and_irq(struct gdix51c0 *gd)
 		}
 	}
 
-	if (gd->irq > 0) {
+	if (gd->irq > 0 && !irq_enable) {
+		dev_warn(gd->dev, "irq_enable=0：不注册中断处理，irq=%d 仅作记录\n",
+			 gd->irq);
+	} else if (gd->irq > 0) {
 		ret = devm_request_irq(
 			gd->dev, gd->irq, gdix51c0_irq_handler,
 			irq_edge_trigger

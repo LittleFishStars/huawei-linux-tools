@@ -8,7 +8,7 @@
 # 打包会先编一次模块（需要 linux-headers）；装包后 DKMS 再为每个已安装内核各编一次。
 
 pkgname=gdix51c0-fp
-pkgver=0.1.6
+pkgver=0.1.7
 pkgrel=1
 pkgdesc='HUAWEI MateBook X Pro (MRGF-XX) 指纹传感器 GDIX51C0 的 SPI 传输模块与用户态工具'
 arch=('any')

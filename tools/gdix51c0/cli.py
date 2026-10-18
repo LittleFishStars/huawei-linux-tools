@@ -258,14 +258,27 @@ def cmd_diag(args: argparse.Namespace) -> int:
 
         # 内核里实际生效的中断配置（sysfs 里那张表是 ACPI 声明的，
         # 未必等于 request_irq 之后真正生效的类型）
+        stale_module = False
         for extra in ("irqinfo", "info"):
             path = f"/sys/bus/spi/devices/spi-GDIX51C0:00/{extra}"
             try:
                 with open(path) as fp:
                     for line in fp.read().splitlines():
                         print(f"[{extra}] {line}")
+            except FileNotFoundError:
+                if extra == "irqinfo":
+                    stale_module = True
+                print(f"[{extra}] 读不到（属性不存在）")
             except OSError as exc:
                 print(f"[{extra}] 读不到（{exc}）")
+
+        if stale_module:
+            print()
+            print("!! 当前加载的不是 0.1.6 或更新版本的模块（缺少 irqinfo 属性）。")
+            print("   下面的结果没有参考价值，请先真正重新加载：")
+            print("     sudo sh -c 'modprobe -r gdix51c0_fp; modprobe gdix51c0_fp'")
+            print("     ls /sys/bus/spi/devices/spi-GDIX51C0:00/ | grep irqinfo")
+            return 2
 
         print("\n-- 空闲时的中断速率 --")
         idle_rate = rate("静止 0.5s")
@@ -296,6 +309,19 @@ def cmd_diag(args: argparse.Namespace) -> int:
                         print(f"  {name:10} {fp.read().strip()}")
                 except OSError:
                     pass
+
+        # /proc/interrupts 是内核自己记的到计数，与我们的 handler 无关。
+        # 两者对照能区分"硬件/上游在计数"和"我们的 handler 在重入"。
+        print("\n-- 内核中断计数（/proc/interrupts）--")
+        try:
+            with open("/proc/interrupts") as fp:
+                for line in fp:
+                    if "gdix51c0" in line:
+                        print(f"  {line.strip()}")
+                    elif line.split(":")[0].strip() == str(info.irq):
+                        print(f"  {line.strip()}")
+        except OSError as exc:
+            print(f"  读不到（{exc}）")
 
         print("\n-- 中断脚电平（连续采样，看线是不是一直拉着）--")
         try:
