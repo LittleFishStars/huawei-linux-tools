@@ -4,6 +4,7 @@
 子命令一览：
 
     info        打印设备与驱动信息（不需要 PSK）
+    diag        裸总线诊断：看 MISO 与中断计数
     otp         打印芯片 ID、OTP 摘要与自校准 DAC
     provision   生成并部署一个新 PSK（破坏性，会覆盖传感器里的旧密钥）
     capture     采一帧指纹并存成 PGM/PNG
@@ -100,11 +101,10 @@ def _print_missing_gpio_hint(info) -> None:
 
 def cmd_otp(args: argparse.Namespace) -> int:
     with Session(device_path=args.device) as sess:
-        # 只跑前半段初始化，不碰 TLS
-        sess._get_evk_version()
-        sess._reset_sensor("otp-reset")
-        chip_id = sess._read_chip_id()
-        otp = sess._read_otp()
+        # 走完整的激活流程：_boot_probe 是会话第一步，跳过它 0xa8 会静默
+        sess.start()
+        chip_id = sess.sensor.chip_id
+        otp = sess.sensor.otp
         dac = sess._dac_from_otp(otp)
     print(f"芯片 ID    0x{chip_id:04x}")
     print(f"OTP 长度   {len(otp)} 字节")
@@ -230,6 +230,65 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_diag(args: argparse.Namespace) -> int:
+    """裸总线诊断：看 MISO 上到底回了什么。
+
+    初始化失败时先跑这个：能看到复位前后的 IRQ 计数、发出去的字节、
+    以及 MISO 是真 0xff（总线空）还是别的东西（时序/极性不对）。
+    """
+    from . import proto as _proto
+    from . import wire as _wire
+
+    dev = KernelDevice(args.device)
+    try:
+        info = dev.info()
+        print(f"ACPI HID   {info.hid}")
+        print(f"IRQ        {info.irq}")
+        print(f"复位 GPIO  {'有' if info.reset_valid else '无'}")
+        print(f"初始中断计数 {dev.irq_count()}")
+
+        def idle_read(n: int = 16) -> str:
+            return dev.xfer(b"\xff" * n, n, 0).hex()
+
+        print("\n-- 复位前 --")
+        print(f"  空闲 MISO  {idle_read()}")
+
+        print("\n-- 硬复位 --")
+        before = dev.irq_count()
+        dev.reset(10_000)
+        time.sleep(0.2)
+        after = dev.irq_count()
+        delta = after - before
+        print(f"  中断计数   {before} → {after}（差 {delta}）")
+        if delta == 0:
+            print("  ！复位后没有启动脉冲：MCU 可能未被复位，或中断脚不可用")
+        print(f"  复位后 MISO {idle_read()}")
+
+        print("\n-- prefix01 + 0xa8 --")
+        dev.xfer(_wire.encode_outer_header(_wire.OUTER_WRITE, len(_proto.PREFIX01)), 0)
+        dev.xfer(_proto.PREFIX01, 0)
+        time.sleep(0.010)
+        a8 = _proto.cmd_firmware_version()
+        dev.xfer(_wire.encode_outer_header(_wire.OUTER_WRITE, len(a8)), 0)
+        dev.xfer(a8, 0)
+        for i in range(8):
+            time.sleep(0.050)
+            print(f"  +{(i + 1) * 50:3d}ms  中断={dev.irq_count():3d}  MISO={idle_read(32)}")
+
+        print("\n-- 0xd5 force-unlock-tls --")
+        d5 = _proto.cmd_force_unlock_tls()
+        dev.xfer(_wire.encode_outer_header(_wire.OUTER_WRITE, len(d5)), 0)
+        dev.xfer(d5, 0)
+        for i in range(4):
+            time.sleep(0.050)
+            print(f"  +{(i + 1) * 50:3d}ms  中断={dev.irq_count():3d}  MISO={idle_read(32)}")
+    finally:
+        dev.close()
+
+    print("\n如果全程 MISO 都是 ff 且中断计数不动：复位极性/时刻不对，或 MCU 没上电。")
+    return 0
+
+
 def _test_wire_roundtrip() -> None:
     pkt = wire.encode_packet(wire.OUTER_WRITE, wire.CMD_IDLE, b"\x14\x00")
     outer, plen = wire.decode_outer_header(pkt[:4])
@@ -289,6 +348,9 @@ def build_parser() -> argparse.ArgumentParser:
     info_p.add_argument("-v", "--verbose", action="store_true",
                         help="同时打印 _CRS 声明的全部资源")
     info_p.set_defaults(func=cmd_info)
+
+    diag_p = sub.add_parser("diag", help="裸总线诊断：看 MISO 与中断计数")
+    diag_p.set_defaults(func=cmd_diag)
 
     sub.add_parser("otp", help="读取芯片 ID、OTP 与自校准 DAC").set_defaults(func=cmd_otp)
 

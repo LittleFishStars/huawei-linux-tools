@@ -276,6 +276,14 @@ def cmd_read_otp() -> bytes:
     body = bytes([0xA6, 0x03, 0x00, 0x00, 0x00, 0x01])
     return body
 
-
 def cmd_ack() -> bytes:
     return wire.encode_command(wire.CMD_ACK)
+
+
+#: force-unlock-tls：把 MCU 从「TLS 已建立」状态退回可接受新会话。
+#: 每个会话开头必发，不带 ACK。校验和 0xd3 = 0xaa - (0xd5+0x03+0x00+0x00+0x00)。
+FORCE_UNLOCK_TLS = bytes([0xD5, 0x03, 0x00, 0x00, 0x00, 0xD3])
+
+
+def cmd_force_unlock_tls() -> bytes:
+    return FORCE_UNLOCK_TLS

@@ -12,7 +12,7 @@
     session    面向使用者的高层 API：init / capture / wait_finger
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 ACPI_HID = "GDIX51C0"
 DEVICE_NODE = "/dev/gdix51c0"

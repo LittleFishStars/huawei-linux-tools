@@ -113,21 +113,26 @@ class Session:
     def _read_packet_wait(self, timeout: float) -> proto.Packet | None:
         """先等中断，再读包。
 
-        MCU 用一条 IRQ 电平表示"有数据待取"，所以等边沿之后立刻读。若中断
-        已经过去（电平仍为高），直接读一次而不是干等。
+        MCU 用一条 IRQ 表示"有数据待取"，所以等边沿之后立刻读。
 
-        中断脚没接上（info.irq_gpio_valid 为假）时不能等边沿 —— 那样每次
-        都会空等到超时。此时退化为纯轮询，由 read_packet 自己退避。
+        注意区分两个能力：
+          - 等边沿（IOC_IRQ_WAIT）走内核 waitqueue，只要 irq 注册成功就能用
+          - 读电平（IOC_IRQ_LEVEL）需要额外的 GpioIo，本机没有
+        所以降级条件看 info.irq，而不是 irq_gpio_valid。之前拿后者当条件，
+        本机因此整条退化成纯轮询——等于在总线上反复打时钟，而官方驱动
+        明确避免这一点（采图时甚至要求完全静默）。
         """
         assert self.dev is not None
         if self.io is None:
             return None
-        if self.info is not None and not self.info.irq_gpio_valid:
-            return self.io.next_packet(timeout)
-        if self.dev.irq_level():
-            return self.io.next_packet(timeout)
-        if not self._await_irq(timeout):
-            return None
+        # 能读电平就先用电平判定（边沿可能已经错过）
+        if self.info is not None and self.info.irq_gpio_valid:
+            if self.dev.irq_level():
+                return self.io.next_packet(timeout)
+        # 等边沿；irq 没注册成功时只能轮询
+        if self.info is not None and self.info.irq:
+            if not self._await_irq(timeout):
+                return None
         return self.io.next_packet(timeout)
 
     def read_tls_packet(self, timeout: float) -> bytes | None:
@@ -180,6 +185,7 @@ class Session:
         assert self.io is not None
         assert self.dev is not None
 
+        self._boot_probe()
         self._get_evk_version()
         self._get_mcu_state()
         self._reset_sensor("reset-sensor-1")
@@ -207,6 +213,35 @@ class Session:
         return self.sensor
 
     # -- 初始化子步骤 --
+
+    def _boot_probe(self) -> None:
+        """会话激活的第一步：复位 → 等启动脉冲 → 解开 TLS 锁定。
+
+        缺了这一步，后续 0xa8 会完全无响应（总线静默）——因为 MCU
+        可能还停在上一会话的 TLS 已建立状态，或者还没从复位里出来。
+
+        顺序与官方一致：
+          1. 硬件复位（拉低 10ms 再释放）
+          2. 等 IRQ 上升沿 + 下降沿（MCU 启动脉冲）
+          3. 等 200ms 让它完全起来，排空残余边沿
+          4. 发 0xd5（force-unlock-tls，无 ACK）
+        """
+        assert self.dev is not None
+        assert self.io is not None
+
+        self._drain(0.005)
+        self._hard_reset()
+
+        if self.info is not None and self.info.irq:
+            # 启动脉冲：先升后降。等不到也不算致命 —— 有些固件版本
+            # 不复位后发脉冲，但 0xd5 还是要发。
+            self._await_irq(proto.BOOT_TIMEOUT)
+            self._await_irq(proto.BOOT_TIMEOUT)
+
+        time.sleep(0.200)
+        self._drain(0.010)
+
+        self.io.send_no_ack(proto.cmd_force_unlock_tls())
 
     def _get_evk_version(self) -> None:
         assert self.io is not None

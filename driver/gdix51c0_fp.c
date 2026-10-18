@@ -204,24 +204,52 @@ static int gdix51c0_xfer(struct gdix51c0 *gd, u8 *tx, u8 *rx, size_t len,
 /* 复位                                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * 取一次复位脚。
+ *
+ * 不复用 probe 里那条长期描述符：官方驱动每次复位都是「申请 -> 发脉冲 ->
+ * 释放」，并明确说释放后让内核把线交还给默认态（INPUT/高阻）、由平台
+ * 上拉把 MCU 拉出复位才是对的；把已有的 OUTPUT 请求改成 INPUT **不等价** ——
+ * 内核会保留 OUTPUT 的意图。
+ */
+static int gdix51c0_reset_acquire(struct gdix51c0 *gd)
+{
+	struct gpio_desc *desc;
+
+	desc = devm_gpiod_get_index(gd->dev, "reset", 0, GPIOD_OUT_LOW);
+	if (IS_ERR(desc))
+		return PTR_ERR(desc);
+
+	gd->reset_gpio = desc;
+	return 0;
+}
+
 static void gdix51c0_hw_reset(struct gdix51c0 *gd, u32 hold_us)
 {
+	int ret;
 
 	if (!gd->reset_valid)
 		return;
+
+	ret = gdix51c0_reset_acquire(gd);
+	if (ret) {
+		dev_warn_once(gd->dev, "复位脚重新申请失败: %d\n", ret);
+		return;
+	}
 
 	/*
 	 * gpiod_set_value*() 设的是**逻辑值**，物理极已由描述符的
 	 * active_low 处理（先由 ACPI _CRS 的 polarity 提供，再用模块参数覆盖）。
 	 * 所以“复位有效”恒为逻辑 1，“释放”恒为逻辑 0 —— 不要再自己算反。
 	 */
-	const int assert_level = 1;
-	const int deassert_level = 0;
-	gpiod_set_value_cansleep(gd->reset_gpio, assert_level);
+	gpiod_set_value_cansleep(gd->reset_gpio, 1);
 	usleep_range(hold_us, hold_us + 1000);
-	gpiod_set_value_cansleep(gd->reset_gpio, deassert_level);
-	/* 给 MCU 启动留时间，用户态随后还会按协议再等 */
-	msleep(10);
+	gpiod_set_value_cansleep(gd->reset_gpio, 0);
+	usleep_range(10000, 11000);
+
+	/* 释放：线上拉接管，把 MCU 真正放出复位 */
+	devm_gpiod_put(gd->dev, gd->reset_gpio);
+	gd->reset_gpio = NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -706,23 +734,42 @@ static int gdix51c0_setup_power_and_irq(struct gdix51c0 *gd)
 		dev_warn(gd->dev,
 			 "ACPI GPIO 映射注册失败: %d（复位可能不可用）\n", ret);
 
-	gd->reset_gpio = devm_gpiod_get_index(
-		gd->dev, "reset", 0,
-		gdix51c0_reset_gpio_params[0].active_low ? GPIOD_OUT_HIGH
-							: GPIOD_OUT_LOW);
-	if (IS_ERR(gd->reset_gpio)) {
-		ret = PTR_ERR(gd->reset_gpio);
-		gd->reset_gpio = NULL;
-		dev_warn(gd->dev,
-			 "复位脚解析失败 (crs_entry_index=%d, %d)，复位功能不可用\n",
-			 reset_gpio_index, ret);
-	} else {
-		gd->reset_valid = true;
-		gd->reset_active_low = gdix51c0_reset_gpio_params[0].active_low ? 1 : 0;
-		dev_info(gd->dev,
-			 "复位脚就绪 (crs_entry_index=%d, active_low=%d)\n",
-			 reset_gpio_index,
-			 gdix51c0_reset_gpio_params[0].active_low ? 1 : 0);
+	/*
+	 * 初始电平必须是逻辑 0（= 不复位）。
+	 *
+	 * GPIOD_OUT_HIGH/LOW 设的是逻辑值：在低有效的描述符上，逻辑 1
+	 * 对应物理低，也就是把 MCU 按在复位态。之前写成
+	 * "active_low ? GPIOD_OUT_HIGH : GPIOD_OUT_LOW"，结果从模块加载
+	 * 那一刻起就一直拉着复位，_hard_reset() 里的"拉低"因此成了空操作，
+	 * 只剩一条释放边沿，没有真正的复位脉冲。
+	 */
+	/*
+	 * 只验证一下复位脚能不能取到，然后立即释放。
+	 *
+	 * 不能在这里长期持有：hw_reset() 每次都要重新申请再释放（见文件头），
+	 * 若这里占着，重新申请会直接 EBUSY。
+	 */
+	{
+		struct gpio_desc *probe_desc;
+
+		probe_desc = devm_gpiod_get_index(gd->dev, "reset", 0,
+						  GPIOD_OUT_LOW);
+		if (IS_ERR(probe_desc)) {
+			ret = PTR_ERR(probe_desc);
+			dev_warn(gd->dev,
+				 "复位脚解析失败 (crs_entry_index=%d, %d)，复位功能不可用\n",
+				 reset_gpio_index, ret);
+		} else {
+			gd->reset_valid = true;
+			gd->reset_active_low =
+				gdix51c0_reset_gpio_params[0].active_low ? 1 : 0;
+			dev_info(gd->dev,
+				 "复位脚就绪 (crs_entry_index=%d, active_low=%d)\n",
+				 reset_gpio_index,
+				 gdix51c0_reset_gpio_params[0].active_low ? 1 : 0);
+			/* 交还活：让线上拉接管 */
+			devm_gpiod_put(gd->dev, probe_desc);
+		}
 	}
 
 	/* 中断：_CRS 里的 GpioInt 资源 -> 真实 Linux irq */
@@ -828,9 +875,9 @@ static void gdix51c0_remove(struct spi_device *spi)
 	mutex_lock(&gdix51c0_singleton_lock);
 	if (gd) {
 		misc_deregister(&gdix51c0_miscdev);
-		if (gd->reset_valid)
-			gpiod_set_value_cansleep(gd->reset_gpio,
-						 gd->reset_active_low ? 1 : 0);
+		/* 卸载时把复位脚拉回“不复位”态（描述符可能已释放，故判空） */
+		if (gd->reset_gpio)
+			gpiod_set_value_cansleep(gd->reset_gpio, 0);
 	}
 	gdix51c0_singleton = NULL;
 	mutex_unlock(&gdix51c0_singleton_lock);
