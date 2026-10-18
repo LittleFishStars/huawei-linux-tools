@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import time
 
@@ -272,11 +273,42 @@ def cmd_diag(args: argparse.Namespace) -> int:
             except OSError as exc:
                 print(f"[{extra}] 读不到（{exc}）")
 
+        # 已加载模块 vs 磁盘上的 ko：srcversion 不同就说明内存里跑的是旧版。
+        # modprobe -r 失败时 modprobe 是幂等的、会静默成功，很容易误判。
+        loaded_sv = None
+        try:
+            with open("/sys/module/gdix51c0_fp/srcversion") as fp:
+                loaded_sv = fp.read().strip()
+        except OSError:
+            pass
+        disk_sv = None
+        try:
+            out = subprocess.run(
+                ["modinfo", "-F", "srcversion",
+                 f"/lib/modules/{os.uname().release}/updates/dkms/"
+                 "gdix51c0_fp.ko.zst"],
+                capture_output=True, text=True, timeout=5)
+            if out.returncode == 0:
+                disk_sv = out.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        if loaded_sv:
+            print(f"[已加载 srcversion] {loaded_sv}")
+        if disk_sv:
+            print(f"[磁盘上 srcversion] {disk_sv}")
+        if loaded_sv and disk_sv and loaded_sv != disk_sv:
+            stale_module = True
+            print("  ！内存里的模块与磁盘上的不是同一份")
+
         if stale_module:
             print()
-            print("!! 当前加载的不是 0.1.6 或更新版本的模块（缺少 irqinfo 属性）。")
-            print("   下面的结果没有参考价值，请先真正重新加载：")
-            print("     sudo sh -c 'modprobe -r gdix51c0_fp; modprobe gdix51c0_fp'")
+            print("!! 当前加载的不是新版本的模块，下面的结果没有参考价值。")
+            print("   注意：modprobe -r 失败时 modprobe 是幂等的、会静默成功，")
+            print("   所以必须确认旧模块真的卸载了：")
+            print("     sudo rmmod gdix51c0_fp")
+            print("     ls /sys/module/gdix51c0_fp 2>/dev/null   # 必须无输出")
+            print("     sudo modprobe gdix51c0_fp")
             print("     ls /sys/bus/spi/devices/spi-GDIX51C0:00/ | grep irqinfo")
             return 2
 
@@ -421,8 +453,17 @@ def cmd_pin(args: argparse.Namespace) -> int:
     finally:
         dev.close()
 
-    print("\n判断：哪种电平能让中断速率降到 0 且 MISO 不再全 ff，")
-    print("那一个就是让传感器工作的状态（若是电源使能，那就是'上电'）。")
+    print("\n怎么读结果：")
+    print("  · 若某个电平下中断速率从上千次/秒降到接近 0，且 MISO 不再全 ff")
+    print("    → 那就是传感器的工作状态，把它固定下来即可。")
+    print("  · 若两种电平下中断速率都差不多、MISO 始终全 ff")
+    print("    → 这根线不是复位/使能，传感器没被正确上电或引脚用途另有其他，")
+    print("      需要从 Windows 驱动侧确认它的真实语义。")
+    print()
+    print("注意：_CRS 里这根线是 active-low + pullup，即空闲为高。")
+    print("  若是复位脚，高 = 不复位（芯片应正常工作）；")
+    print("  若是电源使能，高 = 断电（芯片根本不供电，MISO 自然是全 ff）。")
+    print("  后者能一次性解释'SPI 传输成功但无应答 + 中断空转'。")
     return 0
 
 
