@@ -96,6 +96,7 @@ struct gdix51c0 {
 	struct gpio_desc *reset_gpio;
 	struct gpio_desc *irq_gpio;
 	struct gpio_desc *irq_desc;	/* 中断脚描述符（用于边沿触发 irq） */
+	struct device *ctrl_dev;	/* SPI 控制器设备（pm_keep_awake 用） */
 	int irq;
 
 	struct mutex io_lock;		/* 串行化复位与 SPI 传输 */
@@ -646,7 +647,9 @@ static ssize_t info_show(struct device *dev, struct device_attribute *attr,
 			  gd->reset_valid ? "yes" : "no",
 			  gd->irq_gpio ? "yes" : "no",
 			  gd->speed_hz, gd->chunk,
-			  pm_runtime_active(gd->dev) ? "active" : "suspended");
+			  !gd->ctrl_dev ? "n/a"
+			  : (pm_runtime_active(gd->ctrl_dev) ? "active"
+							     : "suspended"));
 }
 static DEVICE_ATTR_RO(info);
 
@@ -1155,18 +1158,25 @@ static int gdix51c0_probe(struct spi_device *spi)
 	dev_set_drvdata(&spi->dev, gd);
 
 	/*
-	 * 让控制器不再自动挂起。
+	 * 把 SPI 控制器保持在 active。
 	 *
-	 * power/control 默认是 auto，空闲就会 suspend；配合 xfer 里的
-	 * pm_runtime_resume_and_get 已经够用，但把 control 设成 on 能让
-	 * 调试时看到的控制器状态是确定的（不会因为两秒没访问就变 suspended，
-	 * 干扰判断）。pm_runtime_allow 在退出时恢复。
+	 * 注意作用对象是 **控制器**（spi->controller->dev），不是这颗 SPI
+	 * 从设备。本机真正会挂起的是 pci 0000:00:1e.2（pxa2xx-spi），
+	 * 对 spi->dev 做 PM 控制影响不到它 —— 之前那次就是错在这里：
+	 * pm_keep_awake=Y 却仍看到控制器 suspended。
+	 *
+	 * spi_sync() 内部自会对控制器 resume/put，所以即便不这样设置也能
+	 * 传输；这里只是让控制器常驻 active，避免"访问前刚好挂起"的时序
+	 * 问题，也让调试时看到的状态是确定的。
 	 */
-	pm_runtime_disable(&spi->dev);
-	pm_runtime_set_active(&spi->dev);
-	pm_runtime_enable(&spi->dev);
-	if (pm_keep_awake)
-		pm_runtime_get_noresume(&spi->dev);
+	if (pm_keep_awake && spi->controller && spi->controller->dev.parent) {
+		struct device *ctlr = spi->controller->dev.parent;
+
+		pm_runtime_get_noresume(ctlr);
+		gd->ctrl_dev = ctlr;
+		dev_info(&spi->dev, "SPI 控制器 %s 保持 active\n",
+			 dev_name(ctlr));
+	}
 
 	spi->mode = SPI_MODE_0;
 	spi->bits_per_word = 8;
@@ -1210,9 +1220,8 @@ static void gdix51c0_remove(struct spi_device *spi)
 	mutex_lock(&gdix51c0_singleton_lock);
 	if (gd) {
 		misc_deregister(&gdix51c0_miscdev);
-		if (pm_keep_awake)
-			pm_runtime_put_noidle(gd->dev);
-		pm_runtime_allow(gd->dev);
+		if (gd->ctrl_dev)
+			pm_runtime_put_noidle(gd->ctrl_dev);
 		/* 卸载时把复位脚拉回“不复位”态（描述符可能已释放，故判空） */
 		if (gd->reset_gpio)
 			gpiod_set_value_cansleep(gd->reset_gpio, 0);
