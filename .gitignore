@@ -1,0 +1,16 @@
+# 构建产物
+build/
+vendor/bluez-5.52/
+vendor/bluez-5.52.tar.xz
+vendor/bluez-5.52-install/
+
+# 华为专有 SDK 永不入库
+sdk/lib/*/*.so
+sdk/lib/*.so
+
+# 系统临时
+__pycache__/
+*.o
+*.d
+*.log
+.DS_Store
