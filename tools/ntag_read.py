@@ -159,82 +159,109 @@ def health(bus):
 
 
 def seek_read(fd, addr, n=16):
-    """写 2 字节地址后再读 n 字节。
+    """写 2 字节地址后再读 n 字节。返回 (状态, 数据或 errno)。
 
-    为什么只写 2 字节地址：在 24 系列 EEPROM 协议里，
-      S + DevSel(W) + AddrH + AddrL + P         <- 只设地址指针，不写数据（安全）
-      S + DevSel(W) + AddrH + AddrL + Data + P  <- 完整写操作（会改内容）
-      S + DevSel(W) + Addr + P                  <- 单字节，语义不完整，可能被当成数据
-    所以这里固定用 2 字节形式，绝不附带数据字节。
+    只写 2 字节地址、不附带数据字节。24 系列协议里：
+      S + DevSel(W) + AddrH + AddrL + P            <- 只设指针（安全）
+      S + DevSel(W) + AddrH + AddrL + Data + P     <- 完整写入（会改内容，绝不使用）
+    芯片内容出厂只读锁定，宁可慢也不能误写。
 
-    --sweep 显示每次读到的都是同一段 16 字节全零，说明读事务以 STOP 结束后
-    地址计数器复位到某个固定位置（那里全是零）。若想在 1024 字节里换位置，
-    只能先写地址。当年 ntag_seek.py 正是靠「写地址 + 读」拿到过真实 dump。
+    状态取值：
+      ("ok", bytes)    读成功
+      ("wdone", bytes) 写失败但读到了数据（写可能被忽略）
+      ("nak", errno)   写被 NAK —— 对 Type 2 的 UID/锁定位是正常行为，
+                       而且能证明芯片确实把地址字节当地址解析了
+      ("timeout", e)   超时，适配器多半已 wedged
+      ("other", e)     其它错误
     """
     payload = bytes([(addr >> 8) & 0xFF, addr & 0xFF])
+    werr = None
     try:
         os.write(fd, payload)
     except OSError as e:
-        print("      写地址 %s 失败: %s（errno=%s）"
-              % (payload.hex(" "), e, getattr(e, "errno", "?")))
-        return "werr"
+        werr = getattr(e, "errno", "?")
+        if werr == 9:
+            print("      写地址 %s 失败: EBADF（设备只读打开）" % payload.hex(" "))
+            return ("other", e)
+        if werr == 121:
+            print("      写地址 %s -> NAK（该地址只读，属正常）" % payload.hex(" "))
+        elif werr == 110:
+            print("      写地址 %s -> 超时（适配器可能已 wedged）" % payload.hex(" "))
+            return ("timeout", e)
+        else:
+            print("      写地址 %s 失败: errno=%s" % (payload.hex(" "), werr))
+
     t0 = time.time()
     try:
         d = os.read(fd, n)
     except OSError as e:
-        print("      写地址 %s -> 读失败 errno=%s（%.0f ms）"
-              % (payload.hex(" "), getattr(e, "errno", "?"),
-                 (time.time() - t0) * 1000))
-        return None
-    print("      写地址 %s -> %-3d 字节  %s"
-          % (payload.hex(" "), len(d) if d else 0,
-             d.hex(" ") if d else "(空)"))
-    return d
+        err = getattr(e, "errno", "?")
+        print("      读失败 errno=%s（%.0f ms）" % (err, (time.time() - t0) * 1000))
+        if err == 110:
+            return ("timeout", e)
+        return ("other", e)
+
+    print("      -> %-3d 字节  %s" % (len(d) if d else 0,
+                                     d.hex(" ") if d else "(空)"))
+    if werr == 121:
+        return ("nak", d)
+    return ("wdone", d) if werr is not None else ("ok", d)
 
 
 def seek_scan(fd, n=16):
-    """在多个候选地址上做「写地址 + 读」，看能否命中非零数据。
-
-    候选集覆盖 Type 2 内存的关键位置：
-      0x0000 UID/BCC0      0x0004 UID/BCC1     0x000C CC
-      0x0010 NDEF TLV      0x0040 动态区起点    0x0390 UID-ASCII
-      0x0398 I2C 地址      0x03B3 地址配置字节  0x03C0 CT Lock
-    """
+    """在多个候选地址上做「写地址 + 读」，判断寻址是否可用。"""
     print("\n== 写地址 + 读（定位真实数据所在偏移）==")
-    print("  说明：若写地址能改变读出的内容，说明寻址可用；")
-    print("        若所有地址都返回同一段全零，说明写地址被忽略。")
+    print("  写 15 个候选地址后各读 %d 字节。" % n)
+    print("  判读：不同地址读到不同内容 => 寻址可用；")
+    print("        全部相同            => 写地址被忽略。")
+    print("        某地址 NAK          => 芯片确实在解析地址（只读区拒写）。")
+
     cands = [0x0000, 0x0004, 0x000C, 0x0010, 0x0020, 0x0040, 0x0080,
              0x0100, 0x0200, 0x0300, 0x0380, 0x0390, 0x0398, 0x03B3, 0x03C0]
-    results = {}
+    results, naks = {}, []
+
     for a in cands:
         print("\n  地址 0x%04x:" % a)
-        d = seek_read(fd, a, n)
-        if d == "werr":
-            print("      -> 写被拒绝（可能是 NAK 或已锁），寻址这条路不通")
-            break
-        if d is None:
-            print("      -> 超时，适配器已 wedged，中止扫描")
-            print("      复位：sudo modprobe -r ntag_nfc && "
+        st, val = seek_read(fd, a, n)
+        if st in ("timeout", "other"):
+            print("      -> 中止扫描：适配器不可信")
+            print("      复位：sudo rmmod ntag_nfc && "
                   "sudo insmod driver/ntag_nfc.ko probe_on_load=0")
             break
-        results[a] = d
+        if st == "nak":
+            naks.append(a)
+        results[a] = val
 
     if not results:
         return
+
+    print("\n  == 汇总 ==")
+    print("  成功读到数据的地址：%d / %d" % (len(results), len(cands)))
+    if naks:
+        print("  被 NAK 的地址：%s" % ", ".join("0x%04x" % a for a in naks))
+        print("    ※ UID（0x0000）与锁定位（0x03C0 起）本来只读，NAK 是正常的；")
+        print("      更重要的是：NAK 说明芯片确实把写的字节当地址解析了。")
+
     uniq = []
     for d in results.values():
         if d not in uniq:
             uniq.append(d)
-    print("\n  共试 %d 个地址，%d 种不同内容" % (len(results), len(uniq)))
+
+    print("\n  %d 种不同内容" % len(uniq))
     if len(uniq) == 1:
-        print("  所有地址都返回同一段内容 —— 写地址确实被忽略。")
-        print("  内容: %s" % uniq[0].hex(" "))
-        if uniq[0] == b"\x00" * len(uniq[0]):
-            print("  且全为零：当前指针位置是空白区，且无法用写地址移走。")
+        only = uniq[0]
+        print("  所有地址返回同一段内容 —— 写地址被忽略，无法换位置。")
+        print("  内容: %s" % (only.hex(" ") if only else "(空)"))
+        if only == b"\x00" * len(only):
+            print("  且全为零：指针停在空白区，且不能用写地址移走。")
     else:
-        print("  不同地址读到了不同内容！寻址部分可用。")
-        for a, d in results.items():
-            print("    0x%04x -> %s" % (a, d.hex(" ")))
+        print("  不同地址读到了不同内容 —— 寻址可用，可以逐段读整片。")
+        for a in cands:
+            if a not in results:
+                continue
+            d = results[a]
+            mark = "  NAK" if a in naks else ""
+            print("    0x%04x -> %s%s" % (a, d.hex(" ") if d else "(空)", mark))
 
 
 def sweep_blocks(fd, rounds=32, size=16):
@@ -610,12 +637,18 @@ def main():
         # 走内核模块的 /dev/ntag_nfc：模块已绑定 ACPI client，
         # 此时用户态不能对 0x57 发 I2C_SLAVE（会 EBUSY），所以用模块的读接口
         print("设备 %s" % args.dev)
+        # --seek 要写地址，必须 O_RDWR；其余只读足够。
+        # 直接用 O_RDWR，万一设备只允许只读再退回。
         try:
-            fd = os.open(args.dev, os.O_RDONLY)
+            fd = os.open(args.dev, os.O_RDWR)
         except OSError as e:
-            print("  打不开 %s: %s" % (args.dev, e))
-            print("  先装载模块：sudo insmod driver/ntag_nfc.ko probe_on_load=0")
-            return 1
+            if getattr(e, "errno", None) == 13:
+                fd = os.open(args.dev, os.O_RDONLY)
+                print("  （只读打开；--seek 将不可用）")
+            else:
+                print("  打不开 %s: %s" % (args.dev, e))
+                print("  先装载模块：sudo insmod driver/ntag_nfc.ko probe_on_load=0")
+                return 1
         try:
             if args.probe:
                 probe_sizes(fd)
