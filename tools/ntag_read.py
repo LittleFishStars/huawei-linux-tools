@@ -158,6 +158,85 @@ def health(bus):
     return False
 
 
+def seek_read(fd, addr, n=16):
+    """写 2 字节地址后再读 n 字节。
+
+    为什么只写 2 字节地址：在 24 系列 EEPROM 协议里，
+      S + DevSel(W) + AddrH + AddrL + P         <- 只设地址指针，不写数据（安全）
+      S + DevSel(W) + AddrH + AddrL + Data + P  <- 完整写操作（会改内容）
+      S + DevSel(W) + Addr + P                  <- 单字节，语义不完整，可能被当成数据
+    所以这里固定用 2 字节形式，绝不附带数据字节。
+
+    --sweep 显示每次读到的都是同一段 16 字节全零，说明读事务以 STOP 结束后
+    地址计数器复位到某个固定位置（那里全是零）。若想在 1024 字节里换位置，
+    只能先写地址。当年 ntag_seek.py 正是靠「写地址 + 读」拿到过真实 dump。
+    """
+    payload = bytes([(addr >> 8) & 0xFF, addr & 0xFF])
+    try:
+        os.write(fd, payload)
+    except OSError as e:
+        print("      写地址 %s 失败: %s（errno=%s）"
+              % (payload.hex(" "), e, getattr(e, "errno", "?")))
+        return "werr"
+    t0 = time.time()
+    try:
+        d = os.read(fd, n)
+    except OSError as e:
+        print("      写地址 %s -> 读失败 errno=%s（%.0f ms）"
+              % (payload.hex(" "), getattr(e, "errno", "?"),
+                 (time.time() - t0) * 1000))
+        return None
+    print("      写地址 %s -> %-3d 字节  %s"
+          % (payload.hex(" "), len(d) if d else 0,
+             d.hex(" ") if d else "(空)"))
+    return d
+
+
+def seek_scan(fd, n=16):
+    """在多个候选地址上做「写地址 + 读」，看能否命中非零数据。
+
+    候选集覆盖 Type 2 内存的关键位置：
+      0x0000 UID/BCC0      0x0004 UID/BCC1     0x000C CC
+      0x0010 NDEF TLV      0x0040 动态区起点    0x0390 UID-ASCII
+      0x0398 I2C 地址      0x03B3 地址配置字节  0x03C0 CT Lock
+    """
+    print("\n== 写地址 + 读（定位真实数据所在偏移）==")
+    print("  说明：若写地址能改变读出的内容，说明寻址可用；")
+    print("        若所有地址都返回同一段全零，说明写地址被忽略。")
+    cands = [0x0000, 0x0004, 0x000C, 0x0010, 0x0020, 0x0040, 0x0080,
+             0x0100, 0x0200, 0x0300, 0x0380, 0x0390, 0x0398, 0x03B3, 0x03C0]
+    results = {}
+    for a in cands:
+        print("\n  地址 0x%04x:" % a)
+        d = seek_read(fd, a, n)
+        if d == "werr":
+            print("      -> 写被拒绝（可能是 NAK 或已锁），寻址这条路不通")
+            break
+        if d is None:
+            print("      -> 超时，适配器已 wedged，中止扫描")
+            print("      复位：sudo modprobe -r ntag_nfc && "
+                  "sudo insmod driver/ntag_nfc.ko probe_on_load=0")
+            break
+        results[a] = d
+
+    if not results:
+        return
+    uniq = []
+    for d in results.values():
+        if d not in uniq:
+            uniq.append(d)
+    print("\n  共试 %d 个地址，%d 种不同内容" % (len(results), len(uniq)))
+    if len(uniq) == 1:
+        print("  所有地址都返回同一段内容 —— 写地址确实被忽略。")
+        print("  内容: %s" % uniq[0].hex(" "))
+        if uniq[0] == b"\x00" * len(uniq[0]):
+            print("  且全为零：当前指针位置是空白区，且无法用写地址移走。")
+    else:
+        print("  不同地址读到了不同内容！寻址部分可用。")
+        for a, d in results.items():
+            print("    0x%04x -> %s" % (a, d.hex(" ")))
+
+
 def sweep_blocks(fd, rounds=32, size=16):
     """连续做 rounds 轮 size 字节读，逐轮打印并判断内容是否在变。
 
@@ -519,6 +598,8 @@ def main():
                     help="配合 --dev：连续多轮读，判断内容是否变化（区分 FIFO 空与真数据）")
     ap.add_argument("--rounds", type=int, default=32,
                     help="--sweep 的轮数，默认 32")
+    ap.add_argument("--seek", action="store_true",
+                    help="配合 --dev：在多个候选地址上做「写地址 + 读」，验证寻址是否可用")
     args = ap.parse_args()
 
     if args.file:
@@ -541,6 +622,9 @@ def main():
                 return 0
             if args.sweep:
                 sweep_blocks(fd, args.rounds, args.chunk if args.chunk > 0 else 16)
+                return 0
+            if args.seek:
+                seek_scan(fd, args.chunk if args.chunk > 0 else 16)
                 return 0
             chunk = args.chunk if args.chunk > 0 else 16
             print("  每次连续读 %d 字节（--chunk 可改；上限受芯片 FIFO 限制）" % chunk)
