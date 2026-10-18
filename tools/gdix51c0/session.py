@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -71,6 +72,7 @@ class Session:
     info: DeviceInfo | None = None
     sensor: SensorInfo | None = None
     _started: bool = field(default=False, repr=False)
+    _reset_warned: bool = field(default=False, repr=False)
 
     # -- 生命周期 --
 
@@ -232,6 +234,17 @@ class Session:
     def _hard_reset(self) -> None:
         assert self.dev is not None
         self._drain(0.005)
+        # 复位脚没解析出来时，这个 ioctl 在内核里是空操作（驱动直接返回）。
+        # 静默空转会让后续的超时变得难查，所以明说一句。
+        if self.info is not None and not self.info.reset_valid:
+            if not self._reset_warned:
+                print(
+                    "警告：_CRS 里没有复位 GPIO，硬复位不可用。"
+                    "传感器只能靠 RESET 命令（0xa2）软复位；"
+                    "若初始化反复失败，需要一次物理断电（拔电源/重启）。",
+                    file=sys.stderr,
+                )
+                self._reset_warned = True
         self.dev.reset(10_000)
 
     def _read_chip_id(self) -> int:

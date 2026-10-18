@@ -44,6 +44,8 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <linux/sprintf.h>
+#include <linux/version.h>
 
 #define GDIX51C0_DRV_NAME	"gdix51c0_fp"
 #define GDIX51C0_ACPI_HID	"GDIX51C0"
@@ -455,6 +457,141 @@ static ssize_t info_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(info);
 
+/* ---- _CRS 资源转储：把 ACPI 到底声明了哪些资源打印出来 ----------------
+ *
+ * 这个属性是排查 GPIO 解析失败的唯一可靠手段。GpioIo 找不到时（-ENOENT）
+ * 光靠改 index 试不出来——必须知道 _CRS 里究竟有几个 GpioIo、几个 GpioInt，
+ * 以及每个资源的引脚号、极性、触发方式。
+ */
+
+
+static const char *gdix51c0_trigger_name(u8 t)
+{
+	switch (t) {
+	case ACPI_EDGE_SENSITIVE:  return "edge";
+	case ACPI_LEVEL_SENSITIVE: return "level";
+	default:                   return "?";
+	}
+}
+
+static const char *gdix51c0_polarity_name(u8 p)
+{
+	if (p & ACPI_ACTIVE_LOW)
+		return "active-low";
+	return "active-high";
+}
+
+struct gdix51c0_crs_ctx {
+	char *buf;
+	unsigned int len;
+	unsigned int size;
+	unsigned int gpio_io_idx;
+	unsigned int gpio_int_idx;
+};
+
+static void crs_emit(struct gdix51c0_crs_ctx *ctx, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (ctx->len >= ctx->size)
+		return;
+
+	va_start(ap, fmt);
+	n = vscnprintf(ctx->buf + ctx->len, ctx->size - ctx->len, fmt, ap);
+	va_end(ap);
+
+	if (n > 0)
+		ctx->len += min((unsigned int)n, ctx->size - ctx->len);
+}
+
+static int crs_one_cb(struct acpi_resource *ares, void *data)
+{
+	struct gdix51c0_crs_ctx *ctx = data;
+	struct acpi_resource_gpio *agpio;
+	struct acpi_resource_irq *airq;
+	struct acpi_resource_extended_irq *aeirq;
+	int i;
+
+	switch (ares->type) {
+	case ACPI_RESOURCE_TYPE_GPIO:
+		agpio = &ares->data.gpio;
+		if (agpio->connection_type == ACPI_RESOURCE_GPIO_TYPE_INT) {
+			crs_emit(ctx, "[%u] GpioInt  pins=", ctx->gpio_int_idx++);
+		} else {
+			crs_emit(ctx, "[%u] GpioIo   pins=", ctx->gpio_io_idx++);
+		}
+		for (i = 0; i < agpio->pin_table_length; i++)
+			crs_emit(ctx, i ? ",%u" : "%u", agpio->pin_table[i]);
+		crs_emit(ctx, " %s %s",
+			 gdix51c0_trigger_name(agpio->triggering),
+			 gdix51c0_polarity_name(agpio->polarity));
+		if (agpio->resource_source.string_length > 0)
+			crs_emit(ctx, " src=%.*s",
+				 agpio->resource_source.string_length,
+				 agpio->resource_source.string_ptr);
+		crs_emit(ctx, "\n");
+		break;
+
+	case ACPI_RESOURCE_TYPE_IRQ:
+		airq = &ares->data.irq;
+		crs_emit(ctx, "     IRQ     ");
+		for (i = 0; i < airq->interrupt_count; i++)
+			crs_emit(ctx, i ? ",%u" : "%u", airq->interrupts[i]);
+		crs_emit(ctx, " %s %s\n",
+			 gdix51c0_trigger_name(airq->triggering),
+			 gdix51c0_polarity_name(airq->polarity));
+		break;
+
+	case ACPI_RESOURCE_TYPE_EXTENDED_IRQ:
+		aeirq = &ares->data.extended_irq;
+		crs_emit(ctx, "     ExtIRQ  ");
+		for (i = 0; i < aeirq->interrupt_count; i++)
+			crs_emit(ctx, i ? ",%u" : "%u", aeirq->interrupts[i]);
+		crs_emit(ctx, " %s %s\n",
+			 gdix51c0_trigger_name(aeirq->triggering),
+			 gdix51c0_polarity_name(aeirq->polarity));
+		break;
+
+	default:
+		crs_emit(ctx, "     其它     type=%u\n", ares->type);
+		break;
+	}
+
+	return AE_OK;
+}
+
+static ssize_t resources_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct acpi_device *adev = ACPI_COMPANION(dev);
+	struct gdix51c0_crs_ctx ctx;
+	LIST_HEAD(res_list);
+	int ret;
+
+	ctx.buf = buf;
+	ctx.len = 0;
+	ctx.size = PAGE_SIZE;
+	ctx.gpio_io_idx = 0;
+	ctx.gpio_int_idx = 0;
+
+	if (!adev)
+		return sysfs_emit(buf, "非 ACPI 枚举设备\n");
+
+	ret = acpi_dev_get_resources(adev, &res_list, crs_one_cb, &ctx);
+	acpi_dev_free_resource_list(&res_list);
+	if (ret < 0)
+		return sysfs_emit(buf, "_CRS 读取失败: %d\n", ret);
+
+	crs_emit(&ctx, "\n合计：GpioIo=%u GpioInt=%u\n",
+		 ctx.gpio_io_idx, ctx.gpio_int_idx);
+	crs_emit(&ctx, "模块参数：reset_gpio_index=%d irq_resource_index=%d irq_gpio_index=%d\n",
+		 reset_gpio_index, irq_resource_index, irq_gpio_index);
+
+	return ctx.len;
+}
+static DEVICE_ATTR_RO(resources);
+
 static ssize_t irq_count_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
 {
@@ -471,6 +608,7 @@ static DEVICE_ATTR_RO(irq_count);
 
 static struct attribute *gdix51c0_attrs[] = {
 	&dev_attr_info.attr,
+	&dev_attr_resources.attr,
 	&dev_attr_irq_count.attr,
 	NULL,
 };

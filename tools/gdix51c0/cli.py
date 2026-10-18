@@ -47,9 +47,56 @@ def cmd_info(args: argparse.Namespace) -> int:
     print(f"SPI 速率  {info.speed_hz} Hz")
     print(f"分块大小  {info.chunk} 字节")
     print(f"中断计数  {dev.irq_count()}")
-    print(f"中断电平  {'高' if dev.irq_level() else '低'}")
+    # 中断电平需要 irq_gpio 被解析出来；没有这个资源时 ioctl 会返回 ENODEV，
+    # 不是错误，只是这个功能不可用。
+    if info.irq_gpio_valid:
+        print(f"中断电平  {'高' if dev.irq_level() else '低'}")
+    else:
+        print("中断电平  不可用（_CRS 里没有可读的 GpioIo）")
+    # 把 _CRS 里到底声明了哪些资源打出来。GPIO 解析失败时这是唯一
+    # 能定位到根因的信息（有几个 GpioIo、引脚号、极性）。
+    if not info.reset_valid or not info.irq_gpio_valid:
+        _print_missing_gpio_hint(info)
+        _dump_crs(args.device)
     dev.close()
-    return 0
+
+
+def _dump_crs(device: str) -> None:
+    """读驱动导出的 _CRS 转储（sysfs resources 属性）。"""
+    import glob
+
+    # 设备路径 -> sysfs 属性。传进来的是 /dev/gdix51c0，不能直接拼。
+    cands = glob.glob(
+        "/sys/bus/spi/devices/spi-GDIX51C0:00/resources"
+    ) + glob.glob("/sys/class/misc/gdix51c0/device/resources")
+    if not cands:
+        print("\n（找不到 _CRS 转储属性，可能驱动不是最新版）", file=sys.stderr)
+        return
+    try:
+        with open(cands[0], encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError as exc:
+        print(f"\n（读 _CRS 转储失败：{exc}）", file=sys.stderr)
+        return
+    print("\n== _CRS 实际声明的资源 ==")
+    print(text.rstrip())
+
+
+def _print_missing_gpio_hint(info) -> None:
+    """GPIO 资源缺失时给出下一步的排查建议。"""
+    print()
+    if not info.reset_valid:
+        print(
+            "提示：_CRS 里没有可用的 GpioIo（复位脚）。这不一定会阻止采图：\n"
+            "  传感器在收到 RESET 命令（0x82 之前的 0xa2）后会自己软复位。\n"
+            "  若要试其他资源序号：sudo modprobe gdix51c0_fp reset_gpio_index=N"
+        )
+    if not info.irq_gpio_valid:
+        print(
+            "提示：_CRS 里没有额外的 GpioIo 可读电平。中断本身已经可用\n"
+            "  （IRQ 非 0），所以收发不受影响；只是看不到 IRQ 当前是高还是低。\n"
+            "  读数时用轮询模式也会照常工作。"
+        )
 
 
 def cmd_otp(args: argparse.Namespace) -> int:

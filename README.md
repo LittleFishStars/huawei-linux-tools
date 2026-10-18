@@ -60,7 +60,7 @@ makepkg -si
 
 包做两件事：
 
-1. 把内核模块源码装到 `/usr/src/gdix51c0-fp-0.1.0/`，触发 DKMS 为每个已装
+1. 把内核模块源码装到 `/usr/src/gdix51c0-fp-0.1.1/`，触发 DKMS 为每个已装
    内核编译（pacman 的 dkms hook 自动执行）
 2. 把 `gdix51c0` 工具装到 `/usr/bin`，Python 包装进 site-packages
 
@@ -101,6 +101,14 @@ python3 /usr/share/doc/gdix51c0-fp/tests/test_proto.py   # 协议时序单测（
 
 **3. TLS 记录走 `0xb0` 外框，普通命令走 `0xa0`。** 外框只表示搬运类别，包的
 语义看载荷首字节。图像是 `0x17`（TLS 应用数据），不是命令号。
+
+**4. `_CRS` 里的 GPIO 资源不一定齐全。** 本机实测：GpioInt 有（irq=214），但
+GpioIo 一个都没有（`devm_gpiod_get_index` 返回 `-ENOENT`）。所以复位只能靠
+`0xa2` 命令软复位，硬复位不可用。想看清 `_CRS` 到底声明了哪些资源：
+
+```bash
+cat /sys/bus/spi/devices/spi-GDIX51C0:00/resources
+```
 
 ## 与上游的关系
 
