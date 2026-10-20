@@ -20,6 +20,18 @@ __pycache__/
 raw*.bin
 
 # ACPI 全量 dump（含机器序列号、MSDM OEM 密钥，绝不入库）
+# 用 ** 通配任意层级，避免文件挪到 analysis/raw/acpi/ 后失效
+**/acpi/**/*.dat
+**/acpi/**/*.dsl
+**/acpi/*.dat
+**/acpi/*.dsl
 acpi/*.dat
 acpi/*.dsl
 !analysis/acpi/facp.dat
+
+# 厂商 Windows 驱动与逆向原始素材（体积大、含厂商二进制，不入库）
+analysis/raw/**/*.exe
+analysis/raw/**/*.sys
+analysis/raw/drv/
+analysis/raw/linux/
+analysis/raw/作废/
