@@ -1,0 +1,633 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * ntag_nfc.c - 华为 MateBook 内置 NFC（ACPI NTAG0001 / I2C 挂载）Linux 侧驱动
+ *
+ * 芯片识别（2026-10-18 逆向定论）
+ *   上海复旦微电子 FM11NT082C-NTCI
+ *   双界面 NFC Forum Type 2 标签 + Channel IC
+ *   8Kbit EEPROM = 1024 字节 = 64 block x 16 byte，用户区 888 字节
+ *   接触口 I2C 从地址 0x57（配置字节 EE 0x03B3，默认 7'b1010_111）
+ *   片内铭牌: EE 0x03B7 = "FMSH"，EE 0x0398 = 0x57
+ *
+ *   注意：这颗不是 NFC 控制器（不说 NCI），是标签；接触口实测写地址不生效
+ *   （自增指针 + 纯读），详见项目 README。
+ *
+ * 目标硬件
+ *   机型     : Huawei MateBook X Pro 2023 (MRGF-XX)
+ *   ACPI     : _HID = "NTAG0001"   _CID = 无   (Windows 侧 INF 用 ACPI\NTAG0001 绑定)
+ *   总线     : Intel LPSS DesignWare I2C  (0000:00:15.0 -> i2c-0)  + 一根 GPIO 中断线
+ *
+ * 为什么用内核 i2c 驱动而不是直接操作 /dev/i2c-0
+ *   内核在启动时已经按 ACPI _CRS 里的 I2cSerialBus 资源创建好了 i2c client
+ *   "i2c-NTAG0001:00"（见 /sys/bus/i2c/devices/），从地址与 GpioInt 中断号都写在
+ *   ACPI 表里。绑上这个 client 就自动拿到这两样东西，不需要在代码里硬编码从地址。
+ *
+ * 与用户态工具的配合（重要）
+ *   本模块一旦绑定，内核就不允许用户态再对 0x57 发 I2C_SLAVE
+ *   （会返回 EBUSY / Errno 16）。因此两种用法二选一：
+ *
+ *     A. 用模块：从 /dev/ntag_nfc 取原始流，不需要 /dev/i2c-0
+ *        sudo dd if=/dev/ntag_nfc bs=1 count=2048 of=/tmp/nfc.bin
+ *        python3 tools/ntag_read.py --file /tmp/nfc.bin
+ *
+ *     B. 用用户态工具：先卸掉模块释放地址
+ *        sudo rmmod ntag_nfc
+ *        sudo python3 tools/ntag_read.py
+ *
+ *   两种方式读到的都是同一份片上数据，结果一致。
+ *
+ * 本驱动做四件事
+ *   1. 绑定 ACPI\NTAG0001，打印从地址 / 中断号 / 控制器能力
+ *   2. 提供 /dev/ntag_nfc：read() = 一次连续读（无块边界，最干净）；
+ *      write() = 原始 I2C 写（默认不要用，标签已烧成只读）
+ *   3. 注册 FD 中断（irq 213）：只记录次数与时间戳，不假设芯片语义
+ *   4. 不主动写芯片；probe_on_load 默认 0，置 1 会发 NCI CORE_RESET，
+ *      而本芯片不说 NCI，此路径已作废。
+
+ *
+ * 构建:  make           (需要 linux-headers，Arch: pacman -S linux-headers)
+ * 装载:  sudo insmod ntag_nfc.ko
+ * 观察:  sudo dmesg | grep ntag
+ */
+
+#include <linux/module.h>
+#include <linux/irq.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/i2c.h>
+#include <linux/acpi.h>
+#include <linux/interrupt.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/mutex.h>
+#include <linux/delay.h>
+#include <linux/slab.h>
+#include <linux/ktime.h>
+#include <linux/atomic.h>
+#include <linux/sysfs.h>
+#include <linux/ioctl.h>
+#include <linux/types.h>
+
+#define NTAG_DRV_NAME	"ntag_nfc"
+#define NTAG_MAX_XFER	512
+
+/* NCI 2.0: CORE_RESET_CMD, GID=0 Core / MT=1 Command, payload = reset config */
+static const u8 nci_core_reset[] = { 0x20, 0x00, 0x01, 0x01 };
+
+struct ntag_dev {
+	struct i2c_client	*client;
+	struct miscdevice	misc;
+	struct mutex		lock;		/* 串行化所有 I2C 访问 */
+	u8			last_rx[NTAG_MAX_XFER];
+	size_t			last_rx_len;
+	int			irq;
+	atomic_t		irq_count;
+	ktime_t			irq_last;
+	bool			irq_ok;
+
+	/* --- 中断里立刻读回的一帧 ---
+	 * Windows 驱动的做法：ISR 把挂起的读请求直接完成，用户态拿到的是
+	 * 刚被手机写进 FIFO 的那一帧。只计数不读会错过时序窗口，所以这里
+	 * 在中断线程里同步读一帧并缓存。
+	 */
+	u8			isr_buf[64];
+	size_t			isr_len;
+	u32			isr_events;	/* 成功读到数据的次数 */
+	int			isr_status;	/* 最近一次的返回值 */
+	ktime_t			isr_time;
+};
+
+static struct ntag_dev *ntag;
+
+static bool probe_on_load = false;    /* 默认不发任何数据：0x57 上的很可能是一颗 Type 2 Tag，盲写会毁掉它的配置页 */
+/* 中断触发类型：0=按 ACPI 自动（默认），1=上升沿，2=下降沿，3=双边沿。
+ * 板级布线有时与 ACPI 声明不一致，用这个参数现场纠偏，不必改代码重编。
+ */
+static int irq_type = 0;
+module_param(irq_type, int, 0644);
+MODULE_PARM_DESC(irq_type, "0=ACPI auto, 1=rising, 2=falling, 3=both");
+module_param(probe_on_load, bool, 0644);
+MODULE_PARM_DESC(probe_on_load, "装载时发 NCI CORE_RESET 探测 (默认 0；目标若是 NFC 标签切勿开启)");
+
+static unsigned int isr_read_len = 16;
+module_param(isr_read_len, uint, 0644);
+MODULE_PARM_DESC(isr_read_len, "中断里立刻读回的字节数 (默认 16，受芯片 FIFO 上限约束)");
+
+static bool isr_read_enable = true;
+module_param(isr_read_enable, bool, 0644);
+MODULE_PARM_DESC(isr_read_enable, "中断触发时立刻读一帧 (默认 1)");
+
+static unsigned int read_len = 32;
+module_param(read_len, uint, 0644);
+MODULE_PARM_DESC(read_len, "探测读回的最大字节数 (默认 32)");
+
+/* ------------------------------------------------------------------ */
+/* 底层 I2C 原语                                                        */
+/* ------------------------------------------------------------------ */
+
+static int ntag_i2c_write(struct ntag_dev *nd, const u8 *buf, u16 len)
+{
+	struct i2c_msg msg = {
+		.addr	= nd->client->addr,
+		.flags	= 0,
+		.len	= len,
+		.buf	= (u8 *)buf,
+	};
+	int ret = i2c_transfer(nd->client->adapter, &msg, 1);
+
+	if (ret == 1)
+		return 0;
+	if (ret < 0)
+		return ret;
+	return -EIO;
+}
+
+/*
+ * 先可选地写一个前缀（长度字节 / 0x00 头），再读 len 字节。
+ * 不同厂家的 NCI-over-I2C 读法不一致，这里把前缀暴露出来便于逐个试。
+ */
+static int ntag_i2c_read(struct ntag_dev *nd, u8 *buf, u16 len,
+			 const u8 *prefix, u16 plen)
+{
+	struct i2c_msg msg[2];
+	int ret, n = 0;
+
+	if (plen) {
+		msg[n].addr	= nd->client->addr;
+		msg[n].flags	= 0;
+		msg[n].len	= plen;
+		msg[n].buf	= (u8 *)prefix;
+		n++;
+	}
+	msg[n].addr	= nd->client->addr;
+	msg[n].flags	= I2C_M_RD;
+	msg[n].len	= len;
+	msg[n].buf	= buf;
+	n++;
+
+	ret = i2c_transfer(nd->client->adapter, msg, n);
+	if (ret == n)
+		return 0;
+	if (ret < 0)
+		return ret;
+	return -EIO;
+}
+
+static void ntag_hexdump(const char *tag, const u8 *buf, size_t len)
+{
+	char line[3 * 64 + 1];
+	size_t i, off = 0;
+
+	for (i = 0; i < len && off + 4 < sizeof(line); i++)
+		off += scnprintf(line + off, sizeof(line) - off, "%02x ", buf[i]);
+	dev_info(&ntag->client->dev, "%s [%zu] %s\n", tag, len, line);
+}
+
+/* ------------------------------------------------------------------ */
+/* 中断：只做记录，不假设语义（Windows 侧中断用于唤醒挂起的 16 字节应答） */
+/* ------------------------------------------------------------------ */
+
+static irqreturn_t ntag_irq_handler(int irq, void *data)
+{
+	struct ntag_dev *nd = data;
+	u16 n = isr_read_len;
+	int ret;
+
+	atomic_inc(&nd->irq_count);
+	nd->irq_last = ktime_get();
+
+	if (!isr_read_enable || !n)
+		return IRQ_HANDLED;
+	if (n > sizeof(nd->isr_buf))
+		n = sizeof(nd->isr_buf);
+
+	/* 线程化处理程序里可以睡眠，i2c_transfer 在这里是合法的 */
+	mutex_lock(&nd->lock);
+	ret = ntag_i2c_read(nd, nd->isr_buf, n, NULL, 0);
+	mutex_unlock(&nd->lock);
+
+	nd->isr_status = ret;
+	nd->isr_time = ktime_get();
+	if (!ret) {
+		nd->isr_len = n;
+		nd->isr_events++;
+	} else {
+		nd->isr_len = 0;
+	}
+
+	return IRQ_HANDLED;
+}
+
+/* ------------------------------------------------------------------ */
+/* 探测：判断芯片是否说 NFC Forum NCI                                   */
+/* ------------------------------------------------------------------ */
+
+struct ntag_framing {
+	const char	*name;
+	u8		wprefix[2];	/* 写 CORE_RESET 前加的前缀 */
+	u16		wprefix_len;
+	u8		rprefix[2];	/* 读之前加的前缀 */
+	u16		rprefix_len;
+};
+
+static const struct ntag_framing framings[] = {
+	{ "raw            ", { 0 }, 0, { 0 }, 0 },
+	{ "len-byte-w     ", { 0 }, 0, { 0 }, 0 },   /* 写: 见下面特殊处理 */
+	{ "0x00-head      ", { 0x00 }, 1, { 0x00 }, 1 },
+};
+
+static int ntag_probe_nci(struct ntag_dev *nd)
+{
+	u8 tx[8], rx[NTAG_MAX_XFER];
+	int i, ret, found = 0;
+
+	for (i = 0; i < ARRAY_SIZE(framings); i++) {
+		const struct ntag_framing *f = &framings[i];
+		u16 txlen = 0;
+
+		/* 组装写入帧 */
+		if (f->wprefix_len)
+			memcpy(tx + txlen, f->wprefix, f->wprefix_len),
+			txlen += f->wprefix_len;
+		if (i == 1)			/* "len-byte-w": 前置长度字节 */
+			tx[txlen++] = sizeof(nci_core_reset);
+		memcpy(tx + txlen, nci_core_reset, sizeof(nci_core_reset));
+		txlen += sizeof(nci_core_reset);
+
+		ntag_hexdump("probe: write NCI CORE_RESET_CMD", tx, txlen);
+		ret = ntag_i2c_write(nd, tx, txlen);
+		if (ret) {
+			dev_info(&ntag->client->dev,
+				 "probe[%s] write failed: %d\n", f->name, ret);
+			continue;
+		}
+		msleep(60);			/* NCI 允许 CORE_RESET 有数百 ms 延迟 */
+
+		memset(rx, 0, sizeof(rx));
+		ret = ntag_i2c_read(nd, rx, read_len, f->rprefix, f->rprefix_len);
+		if (ret) {
+			dev_info(&ntag->client->dev,
+				 "probe[%s] read failed: %d\n", f->name, ret);
+			continue;
+		}
+		ntag_hexdump("probe: response", rx, min_t(unsigned int, read_len, 32));
+
+		/* CORE_RESET_RSP: MT=2/GID=0 -> 0x40 0x00 0x01 status */
+		if (rx[0] == 0x40 && rx[1] == 0x00) {
+			dev_info(&ntag->client->dev,
+				 "probe[%s] *** 命中 NCI: CORE_RESET_RSP status=0x%02x ***\n",
+				 f->name, rx[3]);
+			found = 1;
+		}
+		/* CORE_RESET_NTF: 0x60 0x00 ... 里面带厂商/芯片信息 */
+		if (rx[0] == 0x60 && rx[1] == 0x00)
+			dev_info(&ntag->client->dev,
+				 "probe[%s] 收到 CORE_RESET_NTF，芯片自报信息见上面的 hexdump\n",
+				 f->name);
+	}
+	return found;
+}
+
+/* ------------------------------------------------------------------ */
+/* /dev/ntag_nfc：原始读写通道                                          */
+/* ------------------------------------------------------------------ */
+
+static ssize_t ntag_dev_read(struct file *fp, char __user *ubuf,
+			     size_t len, loff_t *ppos)
+{
+	struct ntag_dev *nd = fp->private_data;
+	u8 *buf;
+	int ret;
+
+	if (len == 0 || len > NTAG_MAX_XFER)
+		return -EINVAL;
+	buf = kzalloc(len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	mutex_lock(&nd->lock);
+	ret = ntag_i2c_read(nd, buf, len, NULL, 0);
+	if (!ret) {
+		memcpy(nd->last_rx, buf, len);
+		nd->last_rx_len = len;
+	}
+	mutex_unlock(&nd->lock);
+
+	if (ret) {
+		kfree(buf);
+		return ret;
+	}
+	if (copy_to_user(ubuf, buf, len)) {
+		kfree(buf);
+		return -EFAULT;
+	}
+	kfree(buf);
+	return len;
+}
+
+static ssize_t ntag_dev_write(struct file *fp, const char __user *ubuf,
+			      size_t len, loff_t *ppos)
+{
+	struct ntag_dev *nd = fp->private_data;
+	u8 *buf;
+	int ret;
+
+	if (len == 0 || len > NTAG_MAX_XFER)
+		return -EINVAL;
+	buf = memdup_user(ubuf, len);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+
+	mutex_lock(&nd->lock);
+	ret = ntag_i2c_write(nd, buf, len);
+	mutex_unlock(&nd->lock);
+	kfree(buf);
+
+	return ret ? ret : (ssize_t)len;
+}
+
+/* ------------------------------------------------------------------
+ * 原子「寻址读」ioctl
+ *
+ * 为什么必须是原子：24 系列 EEPROM 的随机地址读要求
+ *     S + DevSel(W) + AddrH + AddrL + Sr + DevSel(R) + data... + P
+ * 写地址与读数据之间必须是「重复起始(Repeated START)」，不能有 STOP。
+ * 用户态先 write() 再 read() 是两次独立事务，中间必然插入 STOP，
+ * 芯片的地址计数器随之复位 —— 这正是之前写地址怎么都不生效的根因。
+ *
+ * 用法（C）:
+ *     struct ntag_xfer_arg a = { .wlen = 2, .rlen = 16 };
+ *     a.w[0] = addr >> 8; a.w[1] = addr & 0xff;
+ *     ioctl(fd, NTAG_XFER, &a);
+ * 成功返回 0，a.rlen 被改写为实际读到的字节数。
+ * ------------------------------------------------------------------ */
+#define NTAG_IOC_MAGIC	'N'
+struct ntag_xfer_arg {
+	__u8	w[8];		/* 先写出的字节（通常 2 字节地址） */
+	__u16	wlen;
+	__u16	rlen;		/* 入：想读多少；出：实际读到多少 */
+	__u8	r[NTAG_MAX_XFER];
+};
+
+#define NTAG_XFER	_IOWR(NTAG_IOC_MAGIC, 1, struct ntag_xfer_arg)
+
+/* 读取中断里缓存下来的那一帧 */
+struct ntag_isr_arg {
+	__u32	events;		/* 累计成功读到的帧数 */
+	__u32	len;		/* 出：最后一帧长度 */
+	__s32	status;		/* 出：最近一次读的返回值 */
+	__u64	ns;		/* 出：最近一次中断的时间戳(单调时钟 ns) */
+	__u8	r[64];
+};
+#define NTAG_GET_ISR	_IOR(NTAG_IOC_MAGIC, 2, struct ntag_isr_arg)
+
+static long ntag_dev_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
+{
+	struct ntag_dev *nd = fp->private_data;
+	struct ntag_xfer_arg a;
+	int ret;
+
+	switch (cmd) {
+	case NTAG_XFER:
+		if (copy_from_user(&a, (void __user *)arg, sizeof(a)))
+			return -EFAULT;
+		if (!a.wlen || a.wlen > sizeof(a.w) ||
+		    !a.rlen || a.rlen > NTAG_MAX_XFER)
+			return -EINVAL;
+
+		mutex_lock(&nd->lock);
+		ret = ntag_i2c_read(nd, a.r, a.rlen, a.w, a.wlen);
+		mutex_unlock(&nd->lock);
+		if (ret)
+			return ret;
+
+		if (copy_to_user((void __user *)arg, &a, sizeof(a)))
+			return -EFAULT;
+		return 0;
+
+	case NTAG_GET_ISR: {
+		struct ntag_isr_arg a;
+
+		memset(&a, 0, sizeof(a));
+		mutex_lock(&nd->lock);
+		a.events = nd->isr_events;
+		a.len = nd->isr_len;
+		a.status = nd->isr_status;
+		a.ns = ktime_to_ns(nd->isr_time);
+		if (nd->isr_len)
+			memcpy(a.r, nd->isr_buf, min_t(size_t, nd->isr_len, sizeof(a.r)));
+		mutex_unlock(&nd->lock);
+		if (copy_to_user((void __user *)arg, &a, sizeof(a)))
+			return -EFAULT;
+		return 0;
+	}
+
+	default:
+		return -ENOTTY;
+	}
+}
+
+static int ntag_dev_open(struct inode *ino, struct file *fp)
+{
+	fp->private_data = ntag;
+	return 0;
+}
+
+static const struct file_operations ntag_fops = {
+	.owner		= THIS_MODULE,
+	.open		= ntag_dev_open,
+	.read		= ntag_dev_read,
+	.write		= ntag_dev_write,
+	.unlocked_ioctl	= ntag_dev_ioctl,
+	.llseek		= noop_llseek,
+};
+
+/* ------------------------------------------------------------------ */
+/* sysfs                                                                */
+/* ------------------------------------------------------------------ */
+
+static ssize_t info_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	struct ntag_dev *nd = ntag;
+
+	return sysfs_emit(buf,
+		"acpi_id     : NTAG0001\n"
+		"i2c_adapter : %s (nr %d)\n"
+		"i2c_addr    : 0x%02x\n"
+		"irq         : %d (%s)\n"
+		"irq_count   : %d\n"
+		"last_rx_len : %zu\n",
+		nd->client->adapter->name, nd->client->adapter->nr,
+		nd->client->addr, nd->irq, nd->irq_ok ? "reserved" : "none",
+		atomic_read(&nd->irq_count), nd->last_rx_len);
+}
+static DEVICE_ATTR_RO(info);
+
+static ssize_t last_rx_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct ntag_dev *nd = ntag;
+
+	return sysfs_emit(buf, "%*phN\n", (int)nd->last_rx_len, nd->last_rx);
+}
+static DEVICE_ATTR_RO(last_rx);
+
+static ssize_t warm_reset_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	int ret;
+
+	mutex_lock(&ntag->lock);
+	ntag->last_rx_len = 0;
+	ret = ntag_probe_nci(ntag);
+	mutex_unlock(&ntag->lock);
+
+	return ret ? 1 : len;
+}
+static DEVICE_ATTR_WO(warm_reset);
+
+static struct attribute *ntag_attrs[] = {
+	&dev_attr_info.attr,
+	&dev_attr_last_rx.attr,
+	&dev_attr_warm_reset.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(ntag);
+
+/* ------------------------------------------------------------------ */
+/* probe / remove                                                       */
+/* ------------------------------------------------------------------ */
+
+static int ntag_probe(struct i2c_client *client)
+{
+	struct ntag_dev *nd;
+	int irq, ret = 0;
+
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C)) {
+		dev_err(&client->dev, "adapter 不支持 I2C_FUNC_I2C\n");
+		return -ENODEV;
+	}
+
+	nd = devm_kzalloc(&client->dev, sizeof(*nd), GFP_KERNEL);
+	if (!nd)
+		return -ENOMEM;
+	nd->client = client;
+	mutex_init(&nd->lock);
+	atomic_set(&nd->irq_count, 0);
+	i2c_set_clientdata(client, nd);
+	ntag = nd;
+
+	/* 从地址是 ACPI _CRS 里 I2cSerialBus 声明的；中断号来自同处 GpioInt */
+	dev_info(&client->dev,
+		 "绑定成功: adapter=%s(nr=%d) i2c_addr=0x%02x irq=%d\n",
+		 client->adapter->name, client->adapter->nr,
+		 client->addr, client->irq);
+
+	irq = client->irq;
+	if (irq <= 0 && ACPI_COMPANION(&client->dev))
+		irq = acpi_dev_gpio_irq_get(ACPI_COMPANION(&client->dev), 0);
+	nd->irq = irq;
+	if (irq > 0) {
+		/* 触发极性以 ACPI 为准：_CRS 里是 GpioInt(Edge, ActiveHigh)，
+		 * 即上升沿。irq_get_trigger_type() 返回内核按 ACPI 映射好的类型，
+		 * 只有它为空时才回落到上升沿。之前硬编码下降沿是错的。
+		 */
+		unsigned long tf = irq_get_trigger_type(irq);
+		const char *tfdesc;
+
+		if (!tf)
+			tf = IRQF_TRIGGER_RISING;
+
+		switch (irq_type) {
+		case 1: tf = IRQF_TRIGGER_RISING;  break;
+		case 2: tf = IRQF_TRIGGER_FALLING; break;
+		case 3: tf = IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING; break;
+		default: break;
+		}
+
+		switch (tf & (IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
+			      IRQF_TRIGGER_HIGH | IRQF_TRIGGER_LOW)) {
+		case IRQF_TRIGGER_RISING:  tfdesc = "上升沿"; break;
+		case IRQF_TRIGGER_FALLING: tfdesc = "下降沿"; break;
+		case IRQF_TRIGGER_HIGH:    tfdesc = "高电平"; break;
+		case IRQF_TRIGGER_LOW:     tfdesc = "低电平"; break;
+		default:                   tfdesc = "双边沿/其它"; break;
+		}
+
+		ret = devm_request_threaded_irq(&client->dev, irq, NULL,
+						ntag_irq_handler,
+						IRQF_ONESHOT | tf,
+						NTAG_DRV_NAME, nd);
+		if (ret) {
+			dev_warn(&client->dev,
+				 "申请中断 %d 失败(%d)，继续存活\n", irq, ret);
+			nd->irq_ok = false;
+			ret = 0;
+		} else {
+			nd->irq_ok = true;
+			dev_info(&client->dev,
+				 "中断 %d 已注册(%s, oneshot)，flags=0x%lx\n",
+				 irq, tfdesc, tf);
+		}
+	} else {
+		dev_warn(&client->dev, "没有可用的 GpioInt（ACPI 未声明或 GPIO 未就绪）\n");
+	}
+
+	nd->misc.name  = NTAG_DRV_NAME;
+	nd->misc.minor = MISC_DYNAMIC_MINOR;
+	nd->misc.fops  = &ntag_fops;
+	nd->misc.mode  = 0600;
+	ret = misc_register(&nd->misc);
+	if (ret) {
+		dev_err(&client->dev, "misc_register 失败: %d\n", ret);
+		return ret;
+	}
+	dev_info(&client->dev, "已创建 /dev/%s\n", NTAG_DRV_NAME);
+
+	if (probe_on_load) {
+		mutex_lock(&nd->lock);
+		ntag_probe_nci(nd);
+		mutex_unlock(&nd->lock);
+	}
+	return 0;
+}
+
+static void ntag_remove(struct i2c_client *client)
+{
+	struct ntag_dev *nd = i2c_get_clientdata(client);
+
+	if (!nd)
+		return;
+	misc_deregister(&nd->misc);
+	ntag = NULL;
+}
+
+static const struct acpi_device_id ntag_acpi_ids[] = {
+	{ "NTAG0001", 0 },
+	{ }
+};
+MODULE_DEVICE_TABLE(acpi, ntag_acpi_ids);
+
+static const struct i2c_device_id ntag_i2c_ids[] = {
+	{ "ntag0001", 0 },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, ntag_i2c_ids);
+
+static struct i2c_driver ntag_driver = {
+	.driver = {
+		.name		= NTAG_DRV_NAME,
+		.acpi_match_table = ACPI_PTR(ntag_acpi_ids),
+		.dev_groups	= ntag_groups,
+	},
+	.probe		= ntag_probe,
+	.remove		= ntag_remove,
+	.id_table	= ntag_i2c_ids,
+};
+module_i2c_driver(ntag_driver);
+
+MODULE_AUTHOR("nfc-re");
+MODULE_DESCRIPTION("Fudan Micro FM11NT082C (ACPI NTAG0001) NFC Type 2 tag over I2C");
+MODULE_LICENSE("GPL");

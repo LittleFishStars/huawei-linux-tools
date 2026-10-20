@@ -1,0 +1,37 @@
+# 内核模块构建产物
+*.ko
+*.o
+*.mod
+*.mod.c
+*.order
+*.symvers
+.*.cmd
+.tmp_versions/
+
+# 反汇编 / 二进制分析中间产物
+*.bin
+objdump*.txt
+
+# 反编译 / 临时文件
+__pycache__/
+*.pyc
+*.tmp
+*.log
+raw*.bin
+
+# ACPI 全量 dump（含机器序列号、MSDM OEM 密钥，绝不入库）
+# 用 ** 通配任意层级，避免文件挪到 analysis/raw/acpi/ 后失效
+**/acpi/**/*.dat
+**/acpi/**/*.dsl
+**/acpi/*.dat
+**/acpi/*.dsl
+acpi/*.dat
+acpi/*.dsl
+!analysis/acpi/facp.dat
+
+# 厂商 Windows 驱动与逆向原始素材（体积大、含厂商二进制，不入库）
+analysis/raw/**/*.exe
+analysis/raw/**/*.sys
+analysis/raw/drv/
+analysis/raw/linux/
+analysis/raw/作废/
