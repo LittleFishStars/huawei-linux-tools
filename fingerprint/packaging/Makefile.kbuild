@@ -1,0 +1,7 @@
+# Kbuild 片段：DKMS 构建时使用
+#
+# dkms 会执行 `make -C <kernel_source_dir> M=<build_dir> modules`，因此
+# /usr/src/gdix51c0-fp-<ver>/Makefile 只需要声明模块对象，不能带自定义目标。
+# 开发用的完整 Makefile 在仓库的 driver/ 下，不装进包里。
+
+obj-m += gdix51c0_fp.o

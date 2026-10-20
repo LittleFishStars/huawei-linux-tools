@@ -1,0 +1,54 @@
+post_install() {
+    cat <<'EOF'
+==> gdix51c0-fp 已安装
+
+    内核模块通过 DKMS 构建，首次安装会自动为当前内核编译：
+
+        dkms status
+
+    若显示 built/installed 即成功。之后：
+
+        sudo modprobe gdix51c0_fp        # 绑定 spi-GDIX51C0:00
+        gdix51c0 info                    # 需要 root（设备 0600）
+
+    设备没绑上时先看：
+
+        ls /sys/bus/spi/devices/spi-GDIX51C0:00/driver
+        dmesg | grep gdix51c0
+
+    首次使用前要生成一次 PSK（破坏性操作，会覆盖传感器里的旧密钥）：
+
+        sudo gdix51c0 provision --yes
+        sudo gdix51c0 capture --wait -o ~/finger.pgm
+
+    注意：provision 之后 Windows 侧与其它主机都需重新部署同一把密钥。
+EOF
+}
+
+post_upgrade() {
+    post_install
+}
+
+pre_remove() {
+    cat <<'EOF'
+==> 卸载 gdix51c0-fp
+
+    正在卸载 DKMS 模块并尽力释放设备。
+EOF
+    # 卸载前尽量把模块拿掉；失败不阻塞卸载（可能正被占用）
+    modprobe -r gdix51c0_fp 2>/dev/null || true
+}
+
+post_remove() {
+    cat <<'EOF'
+==> gdix51c0-fp 已卸载
+
+    PSK 状态文件 /var/lib/fprint/gdix51c0.psk 已保留。
+    确认不再需要时可以手动删除。
+EOF
+}
+
+pre_upgrade() {
+    # 升级时先卸旧模块，否则新模块会因 -EBUSY 装不上
+    modprobe -r gdix51c0_fp 2>/dev/null || true
+}

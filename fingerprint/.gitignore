@@ -1,0 +1,41 @@
+# 内核模块编译产物
+driver/*.o
+driver/*.ko
+driver/*.mod
+driver/*.mod.c
+driver/.*.cmd
+driver/Module.symvers
+driver/modules.order
+driver/.modules.order.cmd
+driver/.module-common.o
+driver/..module-common.o.cmd
+driver/.tmp_versions/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 打包产物
+pkg/
+src/
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.pkg.tar.gz
+
+# 采到的指纹图（生物特征，不该进仓库）
+*.pgm
+*.png
+!docs/**/*.png
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 已构建的包（现成产物，方便直接 pacman -U）
+dist/
+
+# ACPI 原始转储（体积大，且可由 acpidump/iasl 随时重生成）
+analysis/acpi_dump/
